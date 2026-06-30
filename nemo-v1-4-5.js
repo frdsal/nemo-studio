@@ -44,7 +44,6 @@
     rbvUrl: ''
   };
 
-
   /** Unified logging - route ke GAS atau console */
   function _log(msg, level = 'INFO') {
     const ts = new Date().toISOString().substr(11, 8);
@@ -59,7 +58,7 @@
     }
   }
 
-    const state = {
+  const state = {
     running: false,
     stopRequested: false,
     controller: null,
@@ -3459,9 +3458,8 @@
     delete window[APP_KEY];
   }
 
-  
   /** Export state as JSON */
-  exportStateAsJson: function() {
+  function exportStateAsJson() {
     const data = {
       version: APP_VERSION,
       exportedAt: new Date().toISOString(),
@@ -3477,10 +3475,11 @@
     a.download = `nemo-export-${Date.now()}.json`;
     a.click();
     URL.revokeObjectURL(url);
-  },
+  }
 
   window[APP_KEY] = {
     version: APP_VERSION,
+    exportStateAsJson,
     state,
     show,
     hide,
