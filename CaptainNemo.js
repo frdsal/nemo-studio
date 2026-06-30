@@ -1,11 +1,11 @@
 (() => {
   'use strict';
 
-  const APP_VERSION = '1.4.0';
-  const APP_KEY = '__nemoSubfolderStudioDownloaderV140__';
-  const UI_ID = 'nemo_subfolder_studio_downloader_v140';
-  const STYLE_ID = 'nemo_subfolder_studio_downloader_v140_style';
-  const STORE_KEY = 'nemo.subfolderStudio.downloader.v140';
+  const APP_VERSION = '1.4.1';
+  const APP_KEY = '__nemoSubfolderStudioDownloaderV141__';
+  const UI_ID = 'nemo_subfolder_studio_downloader_v141';
+  const STYLE_ID = 'nemo_subfolder_studio_downloader_v141_style';
+  const STORE_KEY = 'nemo.subfolderStudio.downloader.v141';
   const VIEW_PATH = '/reader/services/view.php';
   const READER_PATH = '/reader/index.php';
 
@@ -40,7 +40,8 @@
     includeCover: true,
     includeMetadata: true,
     includeIdentityPage: true,
-    metadata: null
+    metadata: null,
+    rbvUrl: ''
   };
 
   const state = {
@@ -299,10 +300,11 @@
     return direct;
   }
 
-  /** Finds a probable course title heading on an RBV page. */
-  function readCourseTitleFromPage() {
-    const headings = Array.from(document.querySelectorAll('.av-special-heading-tag,h1,h2,h3')).map(node => (node.textContent || '').trim()).filter(Boolean);
-    const raw = headings.find(text => /\b[A-Z]{2,}\d{4}\b/.test(text)) || headings[0] || document.title || '';
+  /** Finds a probable course title heading on an RBV page or fetched RBV document. */
+  function readCourseTitleFromPage(root = document) {
+    const headings = Array.from(root.querySelectorAll('.av-special-heading-tag,h1,h2,h3')).map(node => (node.textContent || '').trim()).filter(Boolean);
+    const docTitle = root === document ? document.title : ((root.querySelector('title') && root.querySelector('title').textContent) || '');
+    const raw = headings.find(text => /\b[A-Z]{2,}\d{4}\b/.test(text)) || headings[0] || docTitle || '';
     const match = raw.match(/\b([A-Z]{2,}\d{4})\b\s*[–-]?\s*(.*?)(?:\s*\((Edisi\s*\d+)\))?\s*$/i);
     if (!match) return { rawTitle: raw, code: '', title: raw, edition: '' };
     return { rawTitle: raw, code: normCourseCode(match[1]), title: (match[2] || '').trim(), edition: (match[3] || '').trim() };
@@ -319,12 +321,37 @@
     } catch { return ''; }
   }
 
+  /** Resolves a URL against an RBV page URL. */
+  function absoluteFrom(value, baseUrl = location.href) {
+    try { return new URL(String(value || ''), baseUrl).href; } catch { return ''; }
+  }
+
+  /** Returns a safe RBV page URL from user input or current location. */
+  function normalizeRbvPageUrl(value) {
+    const raw = String(value || '').trim();
+    if (!raw) return '';
+    try {
+      const url = new URL(raw, location.href);
+      if (url.origin !== location.origin) return '';
+      if (!/^\/lib\//i.test(url.pathname)) return '';
+      url.hash = '';
+      return url.href;
+    } catch {
+      return '';
+    }
+  }
+
+  /** Infers an RBV page URL from the active page. */
+  function inferRbvUrlFromLocation() {
+    return normalizeRbvPageUrl(location.href);
+  }
+
   /** Extracts cover metadata from the active RBV page. */
-  function readCoverFromPage(courseCode) {
+  function readCoverFromPage(courseCode, root = document, baseUrl = location.href) {
     const code = normCourseCode(courseCode);
-    const candidates = Array.from(document.querySelectorAll('img[src]')).map((img, index) => {
-      const src = new URL(img.getAttribute('src') || '', location.href).href;
-      const href = img.closest('a[href]') ? new URL(img.closest('a[href]').getAttribute('href') || '', location.href).href : '';
+    const candidates = Array.from(root.querySelectorAll('img[src]')).map((img, index) => {
+      const src = absoluteFrom(img.getAttribute('src') || '', baseUrl);
+      const href = img.closest('a[href]') ? absoluteFrom(img.closest('a[href]').getAttribute('href') || '', baseUrl) : '';
       const title = img.getAttribute('title') || '';
       const alt = img.getAttribute('alt') || '';
       const filename = (() => { try { return decodeURIComponent(new URL(src).pathname.split('/').pop() || ''); } catch { return ''; } })();
@@ -347,24 +374,24 @@
   }
 
   /** Extracts RBV cover and metadata from the active page. */
-  function extractRbvMetadataFromPage() {
-    const titleInfo = readCourseTitleFromPage();
-    const fulltextLink = Array.from(document.querySelectorAll('a[href]')).map((a, index) => {
-      const href = new URL(a.getAttribute('href') || '', location.href).href;
+  function extractRbvMetadataFromPage(root = document, pageUrl = location.href) {
+    const titleInfo = readCourseTitleFromPage(root);
+    const fulltextLink = Array.from(root.querySelectorAll('a[href]')).map((a, index) => {
+      const href = absoluteFrom(a.getAttribute('href') || '', pageUrl);
       if (!/\/reader\/index\.php\?/i.test(href) || !/[?&]modul=/i.test(href)) return null;
       let modul = '';
       try { modul = new URL(href).searchParams.get('modul') || ''; } catch { }
       return { index, text: (a.textContent || '').trim(), href, code: normCourseCode(modul) };
     }).filter(Boolean)[0] || null;
-    const listItems = Array.from(document.querySelectorAll('.avia_textblock li, li')).map(li => (li.textContent || '').replace(/\s+/g, ' ').trim()).filter(Boolean);
+    const listItems = Array.from(root.querySelectorAll('.avia_textblock li, li')).map(li => (li.textContent || '').replace(/\s+/g, ' ').trim()).filter(Boolean);
     const metaLine = listItems.find(text => /Edisi\s*\d+.*SKS.*Modul/i.test(text)) || '';
     const physicalDescription = listItems.find(text => /Halaman/i.test(text) && /cm/i.test(text)) || '';
     const isbnPrint = (listItems.find(text => /^ISBN\s+/i.test(text) && !/\(E\)/i.test(text)) || '').replace(/^ISBN\s*/i, '').trim();
     const isbnElectronic = (listItems.find(text => /^ISBN\s*\(E\)/i.test(text)) || '').replace(/^ISBN\s*\(E\)\s*/i, '').trim();
     const publisherText = listItems.find(text => /Universitas\s+Terbuka/i.test(text) && /\d{4}/.test(text)) || '';
     const ddcText = listItems.find(text => /DDC/i.test(text)) || '';
-    const authors = Array.from(document.querySelectorAll('.avia_textblock p strong,strong')).map(node => (node.textContent || '').replace(/\s+/g, ' ').trim()).filter(text => text && !/Untuk menggunakan|FULLTEXT|ISBN|Edisi/i.test(text)).slice(0, 4);
-    const descParagraphs = Array.from(document.querySelectorAll('.avia_textblock p,p')).map(p => (p.textContent || '').replace(/\s+/g, ' ').trim()).filter(text => text.length > 90 && !/Untuk menggunakan layanan/i.test(text));
+    const authors = Array.from(root.querySelectorAll('.avia_textblock p strong,strong')).map(node => (node.textContent || '').replace(/\s+/g, ' ').trim()).filter(text => text && !/Untuk menggunakan|FULLTEXT|ISBN|Edisi/i.test(text)).slice(0, 4);
+    const descParagraphs = Array.from(root.querySelectorAll('.avia_textblock p,p')).map(p => (p.textContent || '').replace(/\s+/g, ' ').trim()).filter(text => text.length > 90 && !/Untuk menggunakan layanan/i.test(text));
     const description = descParagraphs.sort((a, b) => b.length - a.length)[0] || '';
     const editionMatch = metaLine.match(/Edisi\s*(\d+)/i) || titleInfo.edition.match(/Edisi\s*(\d+)/i);
     const editionNumber = editionMatch ? Number(editionMatch[1]) : null;
@@ -381,7 +408,7 @@
       fulltextText: fulltextLink ? fulltextLink.text : '',
       modulParam: fulltextLink ? fulltextLink.code : ''
     };
-    const cover = readCoverFromPage(course.code);
+    const cover = readCoverFromPage(course.code, root, pageUrl);
     const metadata = {
       authors: authors.length ? authors : [],
       edition: editionNumber ? `Edisi ${editionNumber}` : titleInfo.edition,
@@ -405,7 +432,7 @@
       app: 'Nemo RBV Cover Metadata',
       version: APP_VERSION,
       analyzedAt: new Date().toISOString(),
-      pageUrl: location.href,
+      pageUrl,
       origin: location.origin,
       course,
       cover,
@@ -488,15 +515,57 @@
   /** Loads metadata from the current RBV page. */
   function importMetadataFromPage() {
     try {
-      const meta = extractRbvMetadataFromPage();
-      if (!meta.course.code && !meta.recommendedForNemo.fulltextCode && !meta.cover.bestUrl) {
-        alert('Metadata RBV tidak terbaca dari halaman ini. Buka halaman detail mata kuliah RBV.');
-        return;
-      }
-      setCourseMetadata(meta, 'halaman');
-      if (!normalizeSubfolder(state.nodes.subfolder ? state.nodes.subfolder.value : state.config.subfolder) && meta.recommendedForNemo.subfolder) applyMetadataSubfolder();
+      const meta = extractRbvMetadataFromPage(document, location.href);
+      setCourseMetadata(meta, 'halaman aktif');
+      if (state.nodes.rbvUrl) state.nodes.rbvUrl.value = normalizeRbvPageUrl(location.href) || state.nodes.rbvUrl.value;
+      if (meta && meta.recommendedForNemo && meta.recommendedForNemo.subfolder && state.nodes.subfolder) state.nodes.subfolder.value = meta.recommendedForNemo.subfolder;
+      readConfigFromUi();
+      saveConfig();
     } catch (error) {
       alert(`Gagal membaca metadata: ${String(error && error.message || error)}`);
+    }
+  }
+
+  /** Fetches and loads metadata from an RBV page URL without opening that page. */
+  async function importMetadataFromRbvUrl() {
+    if (state.running) return;
+    readConfigFromUi();
+    const rbvUrl = normalizeRbvPageUrl(state.config.rbvUrl || (state.nodes.rbvUrl && state.nodes.rbvUrl.value) || inferRbvUrlFromLocation());
+    if (!rbvUrl) {
+      alert('Isi tautan RBV yang valid. Contoh: https://pustaka.ut.ac.id/lib/ekma4314-akuntansi-manajemen-edisi-4/');
+      return;
+    }
+    state.running = true;
+    state.stopRequested = false;
+    state.controller = new AbortController();
+    updateButtons();
+    setStatus('Mengambil metadata dari tautan RBV...');
+    log('Mengambil metadata RBV dari tautan.');
+    try {
+      const response = await fetch(rbvUrl, { method: 'GET', credentials: 'include', cache: 'no-store', signal: state.controller.signal });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const html = await response.text();
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      const meta = extractRbvMetadataFromPage(doc, rbvUrl);
+      if (!meta || !(meta.course && (meta.course.code || meta.course.modulParam))) throw new Error('Metadata RBV tidak terbaca dari tautan.');
+      state.config.rbvUrl = rbvUrl;
+      if (state.nodes.rbvUrl) state.nodes.rbvUrl.value = rbvUrl;
+      setCourseMetadata(meta, 'tautan RBV');
+      if (meta.recommendedForNemo && meta.recommendedForNemo.subfolder && state.nodes.subfolder) {
+        state.nodes.subfolder.value = meta.recommendedForNemo.subfolder;
+      }
+      readConfigFromUi();
+      saveConfig();
+      setStatus('Metadata dari tautan RBV berhasil dimuat.');
+      log('Metadata RBV berhasil dimuat dari tautan.');
+    } catch (error) {
+      setStatus(`Metadata RBV gagal: ${String(error && error.message || error)}`, true);
+      log(`Metadata RBV gagal: ${String(error && error.message || error)}`);
+    } finally {
+      state.running = false;
+      state.stopRequested = false;
+      state.controller = null;
+      updateButtons();
     }
   }
 
@@ -1165,25 +1234,61 @@
     return null;
   }
 
-  /** Finds the last page through page-count hints, then fast existence probing. */
+  /** Validates a page-count hint with full PNG decoding at the boundary. */
+  async function validatePageCountHint(docName, pages, cache, serviceDoc) {
+    const maxPage = Math.max(1, Math.min(2000, Number(state.config.maxPage) || DEFAULTS.maxPage));
+    const n = Number(pages);
+    if (!Number.isInteger(n) || n < 1 || n > maxPage) return { ok: false, pages: n, probes: 0, reason: 'hint-di-luar-batas' };
+    const last = await probePngPage(docName, n, cache, serviceDoc);
+    let probes = 1;
+    if (!last.exists) return { ok: false, pages: n, probes, reason: 'halaman-akhir-tidak-ada', last };
+    if (n >= maxPage) return { ok: true, pages: n, probes, capped: true, reason: 'batas-maksimum' };
+    await probeDelay();
+    const next = await probePngPage(docName, n + 1, cache, serviceDoc);
+    probes += 1;
+    if (next.exists) return { ok: false, pages: n, probes, reason: 'halaman-berikutnya-masih-ada', next };
+    return { ok: true, pages: n, probes, capped: false, reason: 'tervalidasi' };
+  }
+
+  /** Finds the last page accurately. Hints are used only after boundary validation. */
   async function countPages(docName, firstProbe, cache) {
     const maxPage = Math.max(1, Math.min(2000, Number(state.config.maxPage) || DEFAULTS.maxPage));
     if (!firstProbe || !firstProbe.exists) return { pages: 0, capped: false, probes: 0, method: 'none' };
 
-    const readerPages = firstPageCountHint(firstProbe.initSession && firstProbe.initSession.pageHints);
-    if (readerPages) return { pages: readerPages, capped: false, probes: 0, method: 'reader', readerHint: firstProbe.initSession.pageHints };
+    let probes = 1;
+    const hints = [];
 
     const jsonHint = await tryReadJsonPageCount(docName, firstProbe.serviceDocUsed);
-    if (jsonHint && jsonHint.pages && jsonHint.pages <= maxPage) {
-      return { pages: jsonHint.pages, capped: false, probes: 1, method: 'json', jsonHint };
+    if (jsonHint && jsonHint.pages) hints.push({ source: 'json', pages: jsonHint.pages, detail: jsonHint });
+
+    const readerPages = firstPageCountHint(firstProbe.initSession && firstProbe.initSession.pageHints);
+    if (readerPages) hints.push({ source: 'reader', pages: readerPages, detail: firstProbe.initSession.pageHints });
+
+    const seenHints = new Set();
+    for (const hint of hints) {
+      const key = `${hint.source}|${hint.pages}`;
+      if (seenHints.has(key)) continue;
+      seenHints.add(key);
+      const validation = await validatePageCountHint(docName, hint.pages, cache, firstProbe.serviceDocUsed);
+      probes += validation.probes || 0;
+      if (validation.ok) {
+        return {
+          pages: validation.pages,
+          capped: Boolean(validation.capped),
+          probes,
+          method: `${hint.source}-validated`,
+          jsonHint: hint.source === 'json' ? hint.detail : null,
+          readerHint: hint.source === 'reader' ? hint.detail : null,
+          validation
+        };
+      }
     }
 
-    let probes = 1;
     let lo = 1;
     let hi = 2;
     while (hi <= maxPage) {
       await probeDelay();
-      const check = await probePngPageLight(docName, hi, cache, firstProbe.serviceDocUsed);
+      const check = await probePngPage(docName, hi, cache, firstProbe.serviceDocUsed);
       probes += 1;
       if (!check.exists) break;
       lo = hi;
@@ -1192,9 +1297,9 @@
 
     if (hi > maxPage) {
       await probeDelay();
-      const maxCheck = await probePngPageLight(docName, maxPage, cache, firstProbe.serviceDocUsed);
+      const maxCheck = await probePngPage(docName, maxPage, cache, firstProbe.serviceDocUsed);
       probes += 1;
-      if (maxCheck.exists) return { pages: maxPage, capped: true, probes, method: 'png-light' };
+      if (maxCheck.exists) return { pages: maxPage, capped: true, probes, method: 'png-full' };
       hi = maxPage;
     }
 
@@ -1204,7 +1309,7 @@
     while (left <= right) {
       const mid = Math.floor((left + right) / 2);
       await probeDelay();
-      const check = await probePngPageLight(docName, mid, cache, firstProbe.serviceDocUsed);
+      const check = await probePngPage(docName, mid, cache, firstProbe.serviceDocUsed);
       probes += 1;
       if (check.exists) {
         best = mid;
@@ -1213,7 +1318,7 @@
         right = mid - 1;
       }
     }
-    return { pages: best, capped: false, probes, method: 'png-light' };
+    return { pages: best, capped: false, probes, method: 'png-full' };
   }
 
   /** Scans a single candidate document. */
@@ -1371,6 +1476,7 @@
   function readConfigFromUi() {
     const n = state.nodes;
     state.config.subfolder = resolveInputSubfolder(n.subfolder.value);
+    state.config.rbvUrl = normalizeRbvPageUrl(n.rbvUrl ? n.rbvUrl.value : '') || String(n.rbvUrl ? n.rbvUrl.value : '').trim();
     state.config.patternPresetKeys = checkedPatternPresetKeys();
     state.config.customPatterns = n.customPatterns ? n.customPatterns.value : '';
     state.config.patterns = buildEffectivePatternString(state.config);
@@ -2860,8 +2966,11 @@
         <div class="nss-card nss-metadata-card">
           <div class="nss-step"><b>i</b><span>Cover dan metadata</span></div>
           <pre class="nss-meta-summary" data-nss="metadataSummary">Belum ada metadata RBV.</pre>
+          <label>Tautan RBV</label>
+          <input data-nss="rbvUrl" placeholder="https://pustaka.ut.ac.id/lib/...">
           <div class="nss-actions">
-            <button type="button" data-nss="readMetadata">Ambil dari halaman ini</button>
+            <button type="button" data-nss="readMetadataUrl">Ambil dari tautan</button>
+            <button type="button" data-nss="readMetadata">Ambil dari halaman aktif</button>
             <button type="button" data-nss="applyMetadataSubfolder">Pakai kode akses</button>
             <button type="button" data-nss="clearMetadata">Hapus metadata</button>
           </div>
@@ -2950,6 +3059,8 @@
       subfolder: ui.querySelector('[data-nss="subfolder"]'),
       customPatterns: ui.querySelector('[data-nss="customPatterns"]'),
       metadataSummary: ui.querySelector('[data-nss="metadataSummary"]'),
+      rbvUrl: ui.querySelector('[data-nss="rbvUrl"]'),
+      readMetadataUrlBtn: ui.querySelector('[data-nss="readMetadataUrl"]'),
       readMetadataBtn: ui.querySelector('[data-nss="readMetadata"]'),
       applyMetadataSubfolderBtn: ui.querySelector('[data-nss="applyMetadataSubfolder"]'),
       clearMetadataBtn: ui.querySelector('[data-nss="clearMetadata"]'),
@@ -2992,6 +3103,7 @@
 
     const n = state.nodes;
     n.subfolder.value = state.config.subfolder || inferSubfolderFromLocation();
+    if (n.rbvUrl) n.rbvUrl.value = state.config.rbvUrl || inferRbvUrlFromLocation();
     state.config = normalizePatternConfig(state.config);
     state.courseMetadata = state.config.metadata || null;
     state.resolvedCourse = state.courseMetadata ? resolveCourseCodes(state.courseMetadata, state.config.subfolder) : null;
@@ -3017,6 +3129,7 @@
     n.exportBtn.addEventListener('click', exportJson);
     n.downloadModeBtn.addEventListener('click', runSelectedDownloadMode);
     n.clearBtn.addEventListener('click', clearResults);
+    if (n.readMetadataUrlBtn) n.readMetadataUrlBtn.addEventListener('click', importMetadataFromRbvUrl);
     if (n.readMetadataBtn) n.readMetadataBtn.addEventListener('click', importMetadataFromPage);
     if (n.applyMetadataSubfolderBtn) n.applyMetadataSubfolderBtn.addEventListener('click', applyMetadataSubfolder);
     if (n.clearMetadataBtn) n.clearMetadataBtn.addEventListener('click', () => setCourseMetadata(null, 'hapus'));
@@ -3031,7 +3144,7 @@
       saveConfig();
     });
 
-    for (const node of [n.subfolder, n.customPatterns, n.maxPage, n.delayMs, n.timeoutMs].filter(Boolean)) {
+    for (const node of [n.subfolder, n.rbvUrl, n.customPatterns, n.maxPage, n.delayMs, n.timeoutMs].filter(Boolean)) {
       node.addEventListener('change', () => { readConfigFromUi(); saveConfig(); });
       node.addEventListener('input', () => { readConfigFromUi(); saveConfig(); });
     }
@@ -3154,6 +3267,8 @@
     collectDocsFromPageLinks,
     parseReaderLink,
     extractRbvMetadataFromPage,
+    importMetadataFromRbvUrl,
+    normalizeRbvPageUrl,
     resolveCourseCodes,
     importMetadataFromPage,
     applyMetadataSubfolder,
