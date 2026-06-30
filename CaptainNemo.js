@@ -1,24 +1,28 @@
-/* Nemo Subfolder Studio Downloader v1.3.2 Download Modes
-   Web-loadable bundle for bookmarklet loader.
-   Host this file on HTTPS, then point the loader bookmarklet to its public URL. */
+// ==UserScript==
+// @name         Nemo Subfolder Studio - Downloader
+// @namespace    https://pustaka.ut.ac.id/nemo
+// @version      1.3.3
+// @description  Memeriksa isi satu subfolder UT, mengunduh PNG/ZIP, membuat PDF searchable, TXT, dan Markdown.
+// @match        https://pustaka.ut.ac.id/*
+// @run-at       document-idle
+// @grant        none
+// ==/UserScript==
+
 (() => {
   'use strict';
 
-  const APP_VERSION = '1.3.2';
-  const APP_KEY = '__nemoSubfolderStudioDownloaderV132__';
-  const UI_ID = 'nemo_subfolder_studio_downloader_v132';
-  const STYLE_ID = 'nemo_subfolder_studio_downloader_v132_style';
-  const STORE_KEY = 'nemo.subfolderStudio.downloader.v132';
+  const APP_VERSION = '1.3.3';
+  const APP_KEY = '__nemoSubfolderStudioDownloaderV133__';
+  const UI_ID = 'nemo_subfolder_studio_downloader_v133';
+  const STYLE_ID = 'nemo_subfolder_studio_downloader_v133_style';
+  const STORE_KEY = 'nemo.subfolderStudio.downloader.v133';
   const VIEW_PATH = '/reader/services/view.php';
   const READER_PATH = '/reader/index.php';
 
   const PATTERN_PRESETS = [
-    { key: 'toc', label: 'Daftar isi', hint: 'DAFIS, DAFTARISI', patterns: ['DAFIS.pdf', 'DAFTARISI.pdf', 'DAFTAR_ISI.pdf'] },
-    { key: 'overview', label: 'Tinjauan', hint: 'TINJAUAN, TMK', patterns: ['TINJAUAN.pdf', 'TINJAUAN_MATA_KULIAH.pdf', 'TMK.pdf'] },
-    { key: 'm_plain', label: 'Modul M1-M12', hint: 'M1.pdf sampai M12.pdf', patterns: ['M{1-12}.pdf'] },
-    { key: 'm_padded', label: 'Modul M01-M12', hint: 'M01.pdf sampai M12.pdf', patterns: ['M{01-12}.pdf'] },
-    { key: 'modul_plain', label: 'MODUL1-MODUL12', hint: 'MODUL1.pdf sampai MODUL12.pdf', patterns: ['MODUL{1-12}.pdf'] },
-    { key: 'modul_underscore', label: 'MODUL_1-MODUL_12', hint: 'MODUL_1.pdf sampai MODUL_12.pdf', patterns: ['MODUL_{1-12}.pdf'] }
+    { key: 'toc', label: 'DAFIS', hint: 'Daftar isi', patterns: ['DAFIS.pdf'] },
+    { key: 'overview', label: 'TINJAUAN', hint: 'Tinjauan mata kuliah', patterns: ['TINJAUAN.pdf'] },
+    { key: 'm_plain', label: 'M1-M12', hint: 'Modul 1 sampai 12', patterns: ['M{1-12}.pdf'] }
   ];
 
   const DEFAULT_PATTERN_PRESET_KEYS = ['toc', 'overview', 'm_plain'];
@@ -27,7 +31,7 @@
     subfolder: '',
     patternPresetKeys: DEFAULT_PATTERN_PRESET_KEYS.slice(),
     customPatterns: '',
-    patterns: 'DAFIS.pdf, DAFTARISI.pdf, DAFTAR_ISI.pdf, TINJAUAN.pdf, TINJAUAN_MATA_KULIAH.pdf, TMK.pdf, M{1-12}.pdf',
+    patterns: 'DAFIS.pdf, TINJAUAN.pdf, M{1-12}.pdf',
     manualDocs: '',
     useDirectProbe: true,
     initReaderBeforeProbe: true,
@@ -37,6 +41,7 @@
     delayMs: 700,
     timeoutMs: 12000,
     compact: false,
+    testLink: '',
     includeManifest: true,
     includeNativeText: true,
     outputFormat: 'pdf',
@@ -56,6 +61,7 @@
     nodes: {},
     checkedAt: null,
     lastError: null,
+    linkTests: [],
     readerInitCache: new Map(),
     downloadStats: null,
     nativeTextCache: new Map(),
@@ -366,8 +372,8 @@
     const map = new Map();
     const subfolder = normalizeSubfolder(state.config.subfolder);
 
-    const manual = parseManualDocs(state.config.manualDocs, subfolder);
-    for (const doc of manual) addCandidate(map, doc, 'manual');
+    // Manual document/link input was removed from the UI in v1.3.3.
+    // Keep discovery focused on checked document patterns plus optional custom patterns.
 
     if (state.config.usePatterns) {
       const patternDocs = parsePatternDocs(buildEffectivePatternString(state.config));
@@ -695,6 +701,163 @@
   }
 
 
+  /** Parses one pasted reader or service link into document identity. */
+  function parseReaderLink(value) {
+    const raw = String(value || '').trim();
+    if (!raw) return null;
+    try {
+      const url = new URL(raw, location.href);
+      const doc = url.searchParams.get('doc');
+      const subfolder = url.searchParams.get('subfolder');
+      if (!doc) return null;
+      return {
+        href: url.href,
+        doc: toDisplayDoc(doc),
+        serviceDoc: toServiceDoc(doc),
+        subfolder: normalizeSubfolder(subfolder || state.config.subfolder),
+        path: url.pathname
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  /** Adds a document name to the manual input if it is not already present. */
+  function addDocToManualInput(docName) {
+    const doc = toDisplayDoc(docName);
+    if (!doc || !state.nodes.manualDocs) return;
+    const current = String(state.nodes.manualDocs.value || '');
+    const docs = parseManualDocs(current, state.config.subfolder).map(d => d.toLowerCase());
+    if (!docs.includes(doc.toLowerCase())) {
+      state.nodes.manualDocs.value = current.trim() ? `${current.trim()}\n${doc}` : doc;
+      readConfigFromUi();
+      saveConfig();
+    }
+  }
+
+  /** Tests a single pasted reader link and records its exact diagnostic result. */
+  async function testManualLink() {
+    if (state.running) return;
+    readConfigFromUi();
+    const raw = state.nodes.testLink ? state.nodes.testLink.value : '';
+    const parsed = parseReaderLink(raw);
+    if (!parsed || !parsed.doc || !parsed.subfolder) {
+      alert('Tempel link reader yang berisi subfolder dan doc.');
+      return;
+    }
+
+    state.running = true;
+    state.stopRequested = false;
+    state.controller = new AbortController();
+    state.readerInitCache.clear();
+    updateButtons();
+    setStatus(`Menguji link ${parsed.doc}...`);
+    log(`Uji link manual: ${parsed.subfolder} ${parsed.doc}.`);
+
+    const oldSubfolder = state.config.subfolder;
+    const oldInputValue = state.nodes.subfolder ? state.nodes.subfolder.value : oldSubfolder;
+    const cache = new Map();
+    const started = Date.now();
+    let output;
+    try {
+      state.config.subfolder = parsed.subfolder;
+      if (state.nodes.subfolder) state.nodes.subfolder.value = parsed.subfolder;
+      const first = await probePngPage(parsed.doc, 1, cache, parsed.serviceDoc);
+      if (first.exists) {
+        const count = await countPages(parsed.doc, first, cache);
+        const meta = classifyDocument(parsed.doc);
+        output = {
+          testedAt: new Date().toISOString(),
+          valid: true,
+          link: parsed.href,
+          subfolder: parsed.subfolder,
+          doc: parsed.doc,
+          serviceDoc: first.serviceDocUsed || parsed.serviceDoc,
+          label: meta.label,
+          group: meta.group,
+          pages: count.pages,
+          width: first.width,
+          height: first.height,
+          status: first.status,
+          note: count.capped ? `Mencapai batas ${state.config.maxPage}` : 'Tersedia',
+          countMethod: count.method,
+          jsonHint: count.jsonHint || null,
+          triedServiceDocs: first.triedServiceDocs || [],
+          initSession: first.initSession || null,
+          elapsedMs: Date.now() - started
+        };
+        addDocToManualInput(parsed.doc);
+        setStatus(`Link valid. ${parsed.doc} terdeteksi ${count.pages} halaman.`);
+        log(`Link manual valid: ${parsed.doc}, ${count.pages} halaman.`);
+      } else {
+        output = {
+          testedAt: new Date().toISOString(),
+          valid: false,
+          link: parsed.href,
+          subfolder: parsed.subfolder,
+          doc: parsed.doc,
+          serviceDoc: parsed.serviceDoc,
+          pages: 0,
+          width: null,
+          height: null,
+          status: first.status,
+          note: first.note || 'Tidak ditemukan',
+          triedServiceDocs: first.triedServiceDocs || [],
+          initSession: first.initSession || null,
+          elapsedMs: Date.now() - started
+        };
+        setStatus(`Link belum valid: ${parsed.doc} (${output.note}).`, true);
+        log(`Link manual belum valid: ${parsed.doc} (${output.note}).`);
+      }
+    } catch (error) {
+      output = {
+        testedAt: new Date().toISOString(),
+        valid: false,
+        link: parsed.href,
+        subfolder: parsed.subfolder,
+        doc: parsed.doc,
+        serviceDoc: parsed.serviceDoc,
+        pages: 0,
+        status: null,
+        note: String(error && error.message || error),
+        elapsedMs: Date.now() - started
+      };
+      setStatus(`Uji link gagal: ${output.note}`, true);
+      log(`Uji link gagal: ${output.note}`);
+    } finally {
+      state.config.subfolder = parsed.subfolder || oldSubfolder;
+      if (state.nodes.subfolder) state.nodes.subfolder.value = parsed.subfolder || oldInputValue;
+      state.running = false;
+      state.stopRequested = false;
+      state.controller = null;
+      if (output) {
+        state.linkTests.unshift(output);
+        state.linkTests = state.linkTests.slice(0, 20);
+        renderLinkTests();
+      }
+      readConfigFromUi();
+      saveConfig();
+      updateButtons();
+    }
+  }
+
+  /** Renders manual link diagnostic results. */
+  function renderLinkTests() {
+    const box = state.nodes.linkTests;
+    if (!box) return;
+    if (!state.linkTests.length) {
+      box.innerHTML = '<div class="nss-empty-mini">Belum ada uji link manual.</div>';
+      return;
+    }
+    box.innerHTML = state.linkTests.slice(0, 5).map(item => {
+      const status = item.valid ? 'Valid' : 'Gagal';
+      const details = item.valid
+        ? `${item.pages || 0} halaman · ${item.width || '-'}×${item.height || '-'} · doc=${item.serviceDoc || '-'}`
+        : `${item.note || 'Tidak ditemukan'} · doc=${item.serviceDoc || '-'}`;
+      return `<div class="nss-linktest ${item.valid ? 'ok' : 'bad'}"><strong>${escapeHtml(status)} · ${escapeHtml(item.doc || '-')}</strong><span>${escapeHtml(details)}</span></div>`;
+    }).join('');
+  }
+
   /** Runs the scan. */
   async function runScan() {
     if (state.running) return;
@@ -773,13 +936,14 @@
     const n = state.nodes;
     state.config.subfolder = normalizeSubfolder(n.subfolder.value);
     state.config.patternPresetKeys = checkedPatternPresetKeys();
-    state.config.customPatterns = n.customPatterns.value;
+    state.config.customPatterns = n.customPatterns ? n.customPatterns.value : '';
     state.config.patterns = buildEffectivePatternString(state.config);
-    state.config.manualDocs = n.manualDocs.value;
+    state.config.manualDocs = '';
+    state.config.testLink = '';
     state.config.useDirectProbe = true;
-    state.config.initReaderBeforeProbe = Boolean(n.initReaderBeforeProbe.checked);
-    state.config.usePageLinks = Boolean(n.usePageLinks.checked);
-    state.config.usePatterns = Boolean(n.usePatterns.checked);
+    state.config.initReaderBeforeProbe = n.initReaderBeforeProbe ? Boolean(n.initReaderBeforeProbe.checked) : true;
+    state.config.usePageLinks = false;
+    state.config.usePatterns = true;
     state.config.maxPage = Math.max(1, Math.min(2000, Number(n.maxPage.value) || DEFAULTS.maxPage));
     state.config.delayMs = Math.max(0, Math.min(10000, Number(n.delayMs.value) || DEFAULTS.delayMs));
     state.config.timeoutMs = Math.max(3000, Math.min(60000, Number(n.timeoutMs.value) || DEFAULTS.timeoutMs));
@@ -805,7 +969,12 @@
     n.stopBtn.disabled = !state.running;
     n.exportBtn.disabled = !state.results.length;
     if (n.downloadModeBtn) n.downloadModeBtn.disabled = state.running || !selectedResults().length;
+    if (n.zipSelectedBtn) n.zipSelectedBtn.disabled = state.running || !selectedResults().length;
+    if (n.pdfSelectedBtn) n.pdfSelectedBtn.disabled = state.running || !selectedResults().length;
+    if (n.txtSelectedBtn) n.txtSelectedBtn.disabled = state.running || !selectedResults().length;
+    if (n.mdSelectedBtn) n.mdSelectedBtn.disabled = state.running || !selectedResults().length;
     n.clearBtn.disabled = state.running || !state.results.length;
+    if (n.testLinkBtn) n.testLinkBtn.disabled = state.running;
   }
 
   /** Escapes HTML. */
@@ -1997,6 +2166,7 @@
         failedCandidates: state.results.filter(r => !r.valid).length
       },
       results: state.results,
+      linkTests: state.linkTests,
       downloadStats: state.downloadStats,
       logs: state.logs
     };
@@ -2046,7 +2216,7 @@
       <header class="nss-header">
         <div class="nss-brand">
           <strong>Nemo Capture Studio</strong>
-          <span>Subfolder · v1.3.2</span>
+          <span>Subfolder · v1.3.3</span>
         </div>
         <div class="nss-head-actions">
           <button type="button" data-nss="compact">${state.config.compact ? 'Detail' : 'Ringkas'}</button>
@@ -2068,12 +2238,14 @@
           <div class="nss-step"><b>1</b><span>Mata kuliah</span></div>
           <label>Subfolder</label>
           <input data-nss="subfolder" placeholder="Contoh: EKSI441604/">
+          <label>Pola dokumen awal</label>
+          <div class="nss-pattern-presets nss-pattern-front">${renderPatternPresetOptions(state.config)}</div>
+          <p class="nss-note">Fokus awal: DAFIS, TINJAUAN, dan M1 sampai M12. Tambahkan pola khusus di Pengaturan pencarian bila perlu.</p>
           <div class="nss-actions nss-primary-actions">
             <button type="button" class="primary" data-nss="scan">Cek</button>
             <button type="button" class="danger" data-nss="stop">Stop</button>
             <button type="button" data-nss="export">JSON</button>
           </div>
-          <p class="nss-note">Isi kode subfolder. Nemo akan menyiapkan dokumen, memeriksa halaman, lalu menampilkan hasil yang bisa disimpan.</p>
         </div>
 
         <div class="nss-card nss-save-card">
@@ -2109,18 +2281,13 @@
         </div>
 
         <details class="nss-card nss-advanced">
-          <summary><span>Pencarian dokumen</span><em>opsional</em></summary>
+          <summary><span>Pengaturan pencarian</span><em>opsional</em></summary>
           <div class="nss-checks">
-            <label><input type="checkbox" data-nss="usePatterns"> Cari dari pola</label>
             <label><input type="checkbox" data-nss="initReaderBeforeProbe"> Siapkan dokumen dulu</label>
-            <label><input type="checkbox" data-nss="usePageLinks"> Tambahkan link halaman ini</label>
           </div>
-          <label>Pola dokumen</label>
-          <div class="nss-pattern-presets">${renderPatternPresetOptions(state.config)}</div>
-          <label>Pola tambahan manual</label>
-          <textarea data-nss="customPatterns" placeholder="Contoh: BMP.pdf, MATERI{1-12}.pdf, MODUL-{01-12}.pdf"></textarea>
-          <label>Link atau dokumen manual</label>
-          <textarea data-nss="manualDocs" placeholder="Contoh: M3.pdf atau https://pustaka.ut.ac.id/reader/index.php?subfolder=EKSI441604/&doc=M3.pdf"></textarea>
+          <label>Pola tambahan</label>
+          <textarea data-nss="customPatterns" placeholder="Contoh: DAFIS.pdf, TINJAUAN.pdf, M{01-12}.pdf, MODUL{1-12}.pdf"></textarea>
+          <p class="nss-note">Gunakan hanya jika mata kuliah memakai nama dokumen di luar DAFIS, TINJAUAN, dan M1-M12.</p>
         </details>
 
         <details class="nss-card nss-advanced">
@@ -2146,10 +2313,13 @@
       subfolder: ui.querySelector('[data-nss="subfolder"]'),
       customPatterns: ui.querySelector('[data-nss="customPatterns"]'),
       patternPresetChecks: Array.from(ui.querySelectorAll('[data-nss-pattern-key]')),
-      manualDocs: ui.querySelector('[data-nss="manualDocs"]'),
-      usePatterns: ui.querySelector('[data-nss="usePatterns"]'),
+      manualDocs: null,
+      testLink: null,
+      testLinkBtn: null,
+      linkTests: null,
+      usePatterns: null,
       initReaderBeforeProbe: ui.querySelector('[data-nss="initReaderBeforeProbe"]'),
-      usePageLinks: ui.querySelector('[data-nss="usePageLinks"]'),
+      usePageLinks: null,
       maxPage: ui.querySelector('[data-nss="maxPage"]'),
       delayMs: ui.querySelector('[data-nss="delayMs"]'),
       timeoutMs: ui.querySelector('[data-nss="timeoutMs"]'),
@@ -2163,6 +2333,10 @@
       pdfOptions: ui.querySelector('[data-nss="pdfOptions"]'),
       singleBundleOption: ui.querySelector('[data-nss="singleBundleOption"]'),
       downloadPreview: ui.querySelector('[data-nss="downloadPreview"]'),
+      zipSelectedBtn: null,
+      pdfSelectedBtn: null,
+      txtSelectedBtn: null,
+      mdSelectedBtn: null,
       clearBtn: ui.querySelector('[data-nss="clear"]'),
       status: ui.querySelector('[data-nss="status"]'),
       summary: ui.querySelector('[data-nss="summary"]'),
@@ -2175,10 +2349,11 @@
     state.config = normalizePatternConfig(state.config);
     n.customPatterns.value = state.config.customPatterns || '';
     for (const input of n.patternPresetChecks) input.checked = state.config.patternPresetKeys.includes(input.getAttribute('data-nss-pattern-key'));
-    n.manualDocs.value = state.config.manualDocs || '';
-    n.usePatterns.checked = state.config.usePatterns !== false;
     n.initReaderBeforeProbe.checked = state.config.initReaderBeforeProbe !== false;
-    n.usePageLinks.checked = Boolean(state.config.usePageLinks);
+    state.config.manualDocs = '';
+    state.config.testLink = '';
+    state.config.usePatterns = true;
+    state.config.usePageLinks = false;
     n.maxPage.value = state.config.maxPage;
     n.delayMs.value = state.config.delayMs;
     n.timeoutMs.value = state.config.timeoutMs;
@@ -2199,16 +2374,17 @@
       saveConfig();
     });
 
-    for (const node of [n.subfolder, n.customPatterns, n.manualDocs, n.maxPage, n.delayMs, n.timeoutMs]) {
+    for (const node of [n.subfolder, n.customPatterns, n.maxPage, n.delayMs, n.timeoutMs].filter(Boolean)) {
       node.addEventListener('change', () => { readConfigFromUi(); saveConfig(); });
       node.addEventListener('input', () => { readConfigFromUi(); saveConfig(); });
     }
-    for (const node of [n.usePatterns, n.initReaderBeforeProbe, n.usePageLinks, ...n.patternPresetChecks]) node.addEventListener('change', () => { readConfigFromUi(); saveConfig(); });
+    for (const node of [n.initReaderBeforeProbe, ...n.patternPresetChecks].filter(Boolean)) node.addEventListener('change', () => { readConfigFromUi(); saveConfig(); });
     for (const node of [...n.outputFormatRadios, ...n.outputBundleRadios, ...n.pdfSearchableRadios]) node.addEventListener('change', () => { updateSaveModeUi(); readConfigFromUi(); saveConfig(); });
     updateSaveModeUi();
 
     renderResults();
     renderLogs();
+    renderLinkTests();
     updateButtons();
   }
 
@@ -2296,11 +2472,11 @@
     parsePatternDocs,
     buildEffectivePatternString,
     normalizePatternConfig,
-    parseManualDocs,
     extractDocsFromText,
     buildImageUrl,
     getServiceDocVariants,
-    collectDocsFromPageLinks
+    collectDocsFromPageLinks,
+    parseReaderLink
   };
 
   buildUi();
