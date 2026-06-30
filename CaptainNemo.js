@@ -1,11 +1,11 @@
 (() => {
   'use strict';
 
-  const APP_VERSION = '1.4.3';
-  const APP_KEY = '__nemoSubfolderStudioDownloaderV143__';
-  const UI_ID = 'nemo_subfolder_studio_downloader_v143';
-  const STYLE_ID = 'nemo_subfolder_studio_downloader_v143_style';
-  const STORE_KEY = 'nemo.subfolderStudio.downloader.v143';
+  const APP_VERSION = '1.4.4';
+  const APP_KEY = '__nemoSubfolderStudioDownloaderV144__';
+  const UI_ID = 'nemo_subfolder_studio_downloader_v144';
+  const STYLE_ID = 'nemo_subfolder_studio_downloader_v144_style';
+  const STORE_KEY = 'nemo.subfolderStudio.downloader.v144';
   const VIEW_PATH = '/reader/services/view.php';
   const READER_PATH = '/reader/index.php';
 
@@ -321,6 +321,12 @@
     } catch { return ''; }
   }
 
+  /** Returns true when an image clearly belongs to site chrome, menus, flags, or social icons. */
+  function isNonCourseImageCandidate(value) {
+    const text = String(value || '').toLowerCase();
+    return /(?:logo|instagram|facebook|twitter|x\s*perpustakaan|glyph|gtranslate|flags?\/24|\/plugins\/|digital-library|perpustakaan\s+ut|cyber|whatsapp|youtube|linkedin|telegram)/i.test(text);
+  }
+
   /** Resolves a URL against an RBV page URL. */
   function absoluteFrom(value, baseUrl = location.href) {
     try { return new URL(String(value || ''), baseUrl).href; } catch { return ''; }
@@ -355,14 +361,20 @@
       const title = img.getAttribute('title') || '';
       const alt = img.getAttribute('alt') || '';
       const filename = (() => { try { return decodeURIComponent(new URL(src).pathname.split('/').pop() || ''); } catch { return ''; } })();
+      const haystack = [src, href, filename, title, alt].join(' ');
+      const matchesCode = Boolean(code && haystack.toUpperCase().includes(code));
+      const siteChrome = isNonCourseImageCandidate(haystack);
       let score = 0;
-      if (code && (filename.toUpperCase().includes(code) || title.toUpperCase().includes(code) || alt.toUpperCase().includes(code))) score += 30;
+      if (matchesCode) score += 40;
       if (/wp-content\/uploads/i.test(src)) score += 8;
-      if (href && /\.(?:jpe?g|png|webp)$/i.test(href)) score += 10;
-      if (/logo|instagram|facebook|twitter|glyph|gtranslate|flag|digital-library/i.test(filename + ' ' + title + ' ' + alt)) score -= 20;
-      score += Math.min(10, Math.round(((img.naturalWidth || img.width || 0) + (img.naturalHeight || img.height || 0)) / 120));
-      return { index, src, href, filename, title, alt, width: img.naturalWidth || img.width || null, height: img.naturalHeight || img.height || null, score };
-    }).sort((a, b) => b.score - a.score);
+      if (href && /\.(?:jpe?g|png|webp)$/i.test(href)) score += 12;
+      if (siteChrome && !matchesCode) score -= 60;
+      const w = img.naturalWidth || img.width || 0;
+      const h = img.naturalHeight || img.height || 0;
+      if (w >= 120 && h >= 160 && h >= w * 1.1) score += 12;
+      score += Math.min(10, Math.round((w + h) / 120));
+      return { index, src, href, filename, title, alt, width: w || null, height: h || null, score, matchesCode, siteChrome };
+    }).filter(item => item.matchesCode || !item.siteChrome || item.score > 0).sort((a, b) => b.score - a.score);
     const display = candidates[0] || null;
     const bestUrl = display ? (display.href && /\.(?:jpe?g|png|webp)$/i.test(display.href) ? display.href : fullImageUrlCandidate(display.src) || display.src) : '';
     return {
@@ -666,22 +678,65 @@
     return lines.join('\n').replace(/\n{4,}/g, '\n\n\n');
   }
 
-  /** Fetches the selected cover image as a blob. */
-  async function fetchCoverBlob(meta = null) {
+  /** Builds ordered cover URL candidates from analyzer metadata and page image metadata. */
+  function coverUrlCandidatesFromMetadata(meta = null) {
     const data = meta || getActiveMetadata();
     const rec = data && data.recommendedForNemo || {};
     const cover = data && data.cover || {};
-    const url = rec.coverUrl || cover.bestUrl || (cover.best && cover.best.src) || '';
-    if (!url) return null;
-    if (state.coverBlobCache.has(url)) return state.coverBlobCache.get(url);
-    const response = await fetch(url, { credentials: 'include', cache: 'force-cache' });
-    if (!response.ok) throw new Error(`Cover HTTP ${response.status}`);
-    const blob = await response.blob();
-    if (!/^image\//i.test(blob.type || response.headers.get('content-type') || '')) throw new Error('Cover bukan gambar');
-    const filename = rec.coverFilename || cover.bestFilename || (() => { try { return decodeURIComponent(new URL(url).pathname.split('/').pop() || 'cover.jpg'); } catch { return 'cover.jpg'; } })();
-    const out = { url, filename, blob };
-    state.coverBlobCache.set(url, out);
-    return out;
+    const course = data && data.course || {};
+    const code = normCourseCode(rec.courseCode || course.code || '');
+    const push = (list, url, reason = '', source = null) => {
+      const value = absoluteFrom(url || '', data && data.pageUrl || location.href);
+      if (!value || !/\.(?:jpe?g|png|webp)(?:$|[?#])/i.test(value)) return;
+      const text = [value, reason, source && source.title, source && source.alt, source && source.filename].join(' ');
+      if (isNonCourseImageCandidate(text) && !(code && text.toUpperCase().includes(code))) return;
+      list.push({ url: value, reason, source });
+    };
+    const list = [];
+    push(list, rec.coverUrl, 'metadata cover');
+    push(list, cover.bestUrl, 'best cover');
+    push(list, cover.best && cover.best.src, 'best candidate');
+    push(list, cover.display && cover.display.href, 'display href', cover.display);
+    push(list, cover.display && fullImageUrlCandidate(cover.display.src), 'display full image', cover.display);
+    push(list, cover.display && cover.display.src, 'display image', cover.display);
+    for (const item of cover.displayCandidates || cover.candidates || []) {
+      push(list, item.href, 'candidate href', item);
+      push(list, fullImageUrlCandidate(item.src), 'candidate full image', item);
+      push(list, item.src, 'candidate image', item);
+    }
+    const seen = new Set();
+    return list.filter(item => {
+      const key = item.url.replace(/[?#].*$/, '').toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }
+
+  /** Fetches the selected cover image as a blob, trying safe fallbacks if the best URL fails. */
+  async function fetchCoverBlob(meta = null) {
+    const data = meta || getActiveMetadata();
+    const candidates = coverUrlCandidatesFromMetadata(data);
+    let lastError = null;
+    for (const candidate of candidates) {
+      const url = candidate.url;
+      if (state.coverBlobCache.has(url)) return state.coverBlobCache.get(url);
+      try {
+        const response = await fetch(url, { credentials: 'include', cache: 'force-cache' });
+        if (!response.ok) throw new Error(`Cover HTTP ${response.status}`);
+        const blob = await response.blob();
+        if (!/^image\//i.test(blob.type || response.headers.get('content-type') || '')) throw new Error('Cover bukan gambar');
+        if (blob.size < 1024) throw new Error('Cover terlalu kecil');
+        const filename = (() => { try { return decodeURIComponent(new URL(url).pathname.split('/').pop() || 'cover.jpg'); } catch { return 'cover.jpg'; } })();
+        const out = { url, filename, blob, source: candidate.reason || '' };
+        state.coverBlobCache.set(url, out);
+        return out;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    if (lastError) throw lastError;
+    return null;
   }
 
   /** Returns a metadata heading for text exports. */
@@ -2460,7 +2515,10 @@
     const wantsMetadataPage = state.config.includeIdentityPage !== false;
     if (!wantsCover && !wantsMetadataPage) return null;
     const meta = getActiveMetadata();
-    if (!meta) return null;
+    if (!meta) {
+      log('Cover dan metadata dilewati karena metadata belum dimuat.');
+      return null;
+    }
     const cover = wantsCover ? await fetchCoverBlob(meta).catch(() => null) : null;
     if (!wantsMetadataPage && !(cover && cover.blob)) return null;
     return {
@@ -2541,7 +2599,8 @@
       const pageH = 841.89;
       const pageId = reserve();
       const contentId = reserve();
-      const title = (resolved.courseCode || '') + (rec.title || course.title ? ' - ' + (rec.title || course.title) : '');
+      const titleText = rec.title || course.title || '';
+      const title = [resolved.courseCode || '', titleText].filter(Boolean).join(' - ');
       const commands = ['BT', '/F1 22 Tf', '0 Tr', `1 0 0 1 54 790 Tm`, `(${pdfString(title)}) Tj`, 'ET'];
       let y = 755;
       const lines = [
