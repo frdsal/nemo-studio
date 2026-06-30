@@ -1,14 +1,11 @@
-/* Nemo Subfolder Studio Downloader v1.3.4 Speed Optimized
-   Web-loadable bundle for bookmarklet loader.
-   Host this file on HTTPS, then point the loader bookmarklet to its public URL. */
 (() => {
   'use strict';
 
-  const APP_VERSION = '1.3.4';
-  const APP_KEY = '__nemoSubfolderStudioDownloaderV134__';
-  const UI_ID = 'nemo_subfolder_studio_downloader_v134';
-  const STYLE_ID = 'nemo_subfolder_studio_downloader_v134_style';
-  const STORE_KEY = 'nemo.subfolderStudio.downloader.v134';
+  const APP_VERSION = '1.4.0';
+  const APP_KEY = '__nemoSubfolderStudioDownloaderV140__';
+  const UI_ID = 'nemo_subfolder_studio_downloader_v140';
+  const STYLE_ID = 'nemo_subfolder_studio_downloader_v140_style';
+  const STORE_KEY = 'nemo.subfolderStudio.downloader.v140';
   const VIEW_PATH = '/reader/services/view.php';
   const READER_PATH = '/reader/index.php';
 
@@ -25,7 +22,6 @@
     patternPresetKeys: DEFAULT_PATTERN_PRESET_KEYS.slice(),
     customPatterns: '',
     patterns: 'DAFIS.pdf, TINJAUAN.pdf, M{1-12}.pdf',
-    manualDocs: '',
     useDirectProbe: true,
     initReaderBeforeProbe: true,
     usePageLinks: false,
@@ -35,12 +31,16 @@
     speedMode: 'balanced',
     timeoutMs: 12000,
     compact: false,
-    testLink: '',
+    minimized: false,
     includeManifest: true,
     includeNativeText: true,
     outputFormat: 'pdf',
     outputBundle: 'zip',
-    pdfSearchable: true
+    pdfSearchable: true,
+    includeCover: true,
+    includeMetadata: true,
+    includeIdentityPage: true,
+    metadata: null
   };
 
   const state = {
@@ -55,13 +55,15 @@
     nodes: {},
     checkedAt: null,
     lastError: null,
-    linkTests: [],
     readerInitCache: new Map(),
     downloadStats: null,
     nativeTextCache: new Map(),
     pdfStats: null,
     pageMetaCache: new Map(),
-    pageBlobCache: new Map()
+    pageBlobCache: new Map(),
+    courseMetadata: null,
+    resolvedCourse: null,
+    coverBlobCache: new Map()
   };
 
   if (window[APP_KEY] && typeof window[APP_KEY].show === 'function') {
@@ -209,6 +211,393 @@
   /** Converts display document name to the short service doc. */
   function toServiceDoc(docName) {
     return String(docName || '').trim().replace(/\.pdf$/i, '');
+  }
+
+
+  /** Normalizes academic or access codes into uppercase alphanumeric text. */
+  function normCourseCode(value) {
+    return String(value || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  }
+
+  /** Reads the edition number from strings such as "Edisi 4". */
+  function parseEditionNumber(value) {
+    const match = String(value || '').match(/edisi\s*(\d+)/i) || String(value || '').match(/\b(\d{1,2})\b/);
+    const number = match ? Number(match[1]) : null;
+    return Number.isInteger(number) && number > 0 ? number : null;
+  }
+
+  /** Splits an access code into course and edition parts when possible. */
+  function splitAccessCode(value) {
+    const clean = normCourseCode(value);
+    const match = clean.match(/^([A-Z]{2,}\d{4})(\d{2})$/);
+    if (!match) return { courseCode: clean, editionCode: '', editionNumber: 1, fulltextCode: clean };
+    const ed = Number(match[2]);
+    return { courseCode: match[1], editionCode: match[2], editionNumber: ed || null, fulltextCode: clean };
+  }
+
+  /** Resolves academic code and edition into the access/subfolder code used by the reader. */
+  function resolveCourseCodes(metadata = null, userInput = '') {
+    const meta = metadata && typeof metadata === 'object' ? metadata : {};
+    const recommended = meta.recommendedForNemo || {};
+    const course = meta.course || {};
+    const md = meta.metadata || {};
+    const rawInput = normalizeSubfolder(userInput).replace(/\/+$/g, '');
+    const inputCode = normCourseCode(rawInput);
+    const metaCourse = normCourseCode(recommended.courseCode || course.code || recommended.titleCode || '');
+    const fulltextFromPage = normCourseCode(recommended.fulltextCode || recommended.moduleCode || course.modulParam || '');
+    const title = recommended.title || course.title || '';
+    const editionNumber = Number(recommended.editionNumber || parseEditionNumber(recommended.edition || md.edition || '')) || null;
+
+    let courseCode = metaCourse;
+    let fulltextCode = fulltextFromPage;
+    let source = fulltextCode ? 'fulltext-link' : 'input';
+    let confidence = fulltextCode ? 'high' : 'low';
+
+    if (!courseCode && fulltextCode) {
+      const parts = splitAccessCode(fulltextCode);
+      courseCode = parts.courseCode;
+    }
+    if (!courseCode && inputCode) {
+      const parts = splitAccessCode(inputCode);
+      courseCode = parts.courseCode;
+    }
+    if (!fulltextCode && courseCode) {
+      const ed = editionNumber || 1;
+      fulltextCode = ed <= 1 ? courseCode : `${courseCode}${String(ed).padStart(2, '0')}`;
+      source = editionNumber ? 'course-code-and-edition' : 'course-code';
+      confidence = editionNumber ? 'medium' : 'low';
+    }
+    if (inputCode && (!fulltextCode || inputCode.length > (courseCode || '').length)) {
+      fulltextCode = inputCode;
+      const parts = splitAccessCode(inputCode);
+      courseCode = courseCode || parts.courseCode;
+      source = 'user-input';
+      confidence = 'medium';
+    }
+    const effectiveEdition = editionNumber || splitAccessCode(fulltextCode).editionNumber || 1;
+    const editionCode = effectiveEdition <= 1 ? '' : String(effectiveEdition).padStart(2, '0');
+    return {
+      courseCode: courseCode || inputCode || '',
+      title,
+      editionNumber: effectiveEdition,
+      editionCode,
+      fulltextCode: fulltextCode || courseCode || inputCode || '',
+      subfolder: fulltextCode ? `${fulltextCode}/` : '',
+      source,
+      confidence
+    };
+  }
+
+  /** Resolves user input into the reader subfolder, applying edition suffix rules when metadata is present. */
+  function resolveInputSubfolder(value) {
+    const direct = normalizeSubfolder(value);
+    const inputCode = normCourseCode(direct.replace(/\/+$/g, ''));
+    const meta = state.courseMetadata || state.config.metadata || null;
+    if (!meta || !inputCode) return direct;
+    const resolved = resolveCourseCodes(meta, inputCode);
+    if (resolved.fulltextCode && (inputCode === resolved.courseCode || inputCode === resolved.fulltextCode)) return `${resolved.fulltextCode}/`;
+    return direct;
+  }
+
+  /** Finds a probable course title heading on an RBV page. */
+  function readCourseTitleFromPage() {
+    const headings = Array.from(document.querySelectorAll('.av-special-heading-tag,h1,h2,h3')).map(node => (node.textContent || '').trim()).filter(Boolean);
+    const raw = headings.find(text => /\b[A-Z]{2,}\d{4}\b/.test(text)) || headings[0] || document.title || '';
+    const match = raw.match(/\b([A-Z]{2,}\d{4})\b\s*[–-]?\s*(.*?)(?:\s*\((Edisi\s*\d+)\))?\s*$/i);
+    if (!match) return { rawTitle: raw, code: '', title: raw, edition: '' };
+    return { rawTitle: raw, code: normCourseCode(match[1]), title: (match[2] || '').trim(), edition: (match[3] || '').trim() };
+  }
+
+  /** Returns a high-resolution image URL candidate by removing WordPress thumbnail suffixes. */
+  function fullImageUrlCandidate(url) {
+    try {
+      const u = new URL(url, location.href);
+      u.hash = '';
+      const path = u.pathname.replace(/-\d+x\d+(?=\.(?:jpe?g|png|webp)$)/i, '');
+      u.pathname = path;
+      return u.href;
+    } catch { return ''; }
+  }
+
+  /** Extracts cover metadata from the active RBV page. */
+  function readCoverFromPage(courseCode) {
+    const code = normCourseCode(courseCode);
+    const candidates = Array.from(document.querySelectorAll('img[src]')).map((img, index) => {
+      const src = new URL(img.getAttribute('src') || '', location.href).href;
+      const href = img.closest('a[href]') ? new URL(img.closest('a[href]').getAttribute('href') || '', location.href).href : '';
+      const title = img.getAttribute('title') || '';
+      const alt = img.getAttribute('alt') || '';
+      const filename = (() => { try { return decodeURIComponent(new URL(src).pathname.split('/').pop() || ''); } catch { return ''; } })();
+      let score = 0;
+      if (code && (filename.toUpperCase().includes(code) || title.toUpperCase().includes(code) || alt.toUpperCase().includes(code))) score += 30;
+      if (/wp-content\/uploads/i.test(src)) score += 8;
+      if (href && /\.(?:jpe?g|png|webp)$/i.test(href)) score += 10;
+      if (/logo|instagram|facebook|twitter|glyph|gtranslate|flag|digital-library/i.test(filename + ' ' + title + ' ' + alt)) score -= 20;
+      score += Math.min(10, Math.round(((img.naturalWidth || img.width || 0) + (img.naturalHeight || img.height || 0)) / 120));
+      return { index, src, href, filename, title, alt, width: img.naturalWidth || img.width || null, height: img.naturalHeight || img.height || null, score };
+    }).sort((a, b) => b.score - a.score);
+    const display = candidates[0] || null;
+    const bestUrl = display ? (display.href && /\.(?:jpe?g|png|webp)$/i.test(display.href) ? display.href : fullImageUrlCandidate(display.src) || display.src) : '';
+    return {
+      display,
+      bestUrl,
+      bestFilename: (() => { try { return decodeURIComponent(new URL(bestUrl).pathname.split('/').pop() || 'cover'); } catch { return 'cover'; } })(),
+      displayCandidates: candidates.slice(0, 12)
+    };
+  }
+
+  /** Extracts RBV cover and metadata from the active page. */
+  function extractRbvMetadataFromPage() {
+    const titleInfo = readCourseTitleFromPage();
+    const fulltextLink = Array.from(document.querySelectorAll('a[href]')).map((a, index) => {
+      const href = new URL(a.getAttribute('href') || '', location.href).href;
+      if (!/\/reader\/index\.php\?/i.test(href) || !/[?&]modul=/i.test(href)) return null;
+      let modul = '';
+      try { modul = new URL(href).searchParams.get('modul') || ''; } catch { }
+      return { index, text: (a.textContent || '').trim(), href, code: normCourseCode(modul) };
+    }).filter(Boolean)[0] || null;
+    const listItems = Array.from(document.querySelectorAll('.avia_textblock li, li')).map(li => (li.textContent || '').replace(/\s+/g, ' ').trim()).filter(Boolean);
+    const metaLine = listItems.find(text => /Edisi\s*\d+.*SKS.*Modul/i.test(text)) || '';
+    const physicalDescription = listItems.find(text => /Halaman/i.test(text) && /cm/i.test(text)) || '';
+    const isbnPrint = (listItems.find(text => /^ISBN\s+/i.test(text) && !/\(E\)/i.test(text)) || '').replace(/^ISBN\s*/i, '').trim();
+    const isbnElectronic = (listItems.find(text => /^ISBN\s*\(E\)/i.test(text)) || '').replace(/^ISBN\s*\(E\)\s*/i, '').trim();
+    const publisherText = listItems.find(text => /Universitas\s+Terbuka/i.test(text) && /\d{4}/.test(text)) || '';
+    const ddcText = listItems.find(text => /DDC/i.test(text)) || '';
+    const authors = Array.from(document.querySelectorAll('.avia_textblock p strong,strong')).map(node => (node.textContent || '').replace(/\s+/g, ' ').trim()).filter(text => text && !/Untuk menggunakan|FULLTEXT|ISBN|Edisi/i.test(text)).slice(0, 4);
+    const descParagraphs = Array.from(document.querySelectorAll('.avia_textblock p,p')).map(p => (p.textContent || '').replace(/\s+/g, ' ').trim()).filter(text => text.length > 90 && !/Untuk menggunakan layanan/i.test(text));
+    const description = descParagraphs.sort((a, b) => b.length - a.length)[0] || '';
+    const editionMatch = metaLine.match(/Edisi\s*(\d+)/i) || titleInfo.edition.match(/Edisi\s*(\d+)/i);
+    const editionNumber = editionMatch ? Number(editionMatch[1]) : null;
+    const sksMatch = metaLine.match(/(\d+)\s*SKS/i);
+    const moduleMatch = metaLine.match(/(\d+)\s*Modul/i);
+    const bibPageMatch = physicalDescription.match(/(\d+)\s*Halaman/i);
+    const yearMatch = publisherText.match(/\b(20\d{2}|19\d{2})\b/);
+    const ddcMatch = ddcText.match(/DDC\s*(?:\[[^\]]+\])?\s*([0-9.]+)/i);
+    const course = {
+      code: titleInfo.code || (fulltextLink ? splitAccessCode(fulltextLink.code).courseCode : ''),
+      title: titleInfo.title || '',
+      rawTitle: titleInfo.rawTitle || '',
+      fulltextUrl: fulltextLink ? fulltextLink.href : '',
+      fulltextText: fulltextLink ? fulltextLink.text : '',
+      modulParam: fulltextLink ? fulltextLink.code : ''
+    };
+    const cover = readCoverFromPage(course.code);
+    const metadata = {
+      authors: authors.length ? authors : [],
+      edition: editionNumber ? `Edisi ${editionNumber}` : titleInfo.edition,
+      editionNumber,
+      sks: sksMatch ? Number(sksMatch[1]) : null,
+      modules: moduleMatch ? Number(moduleMatch[1]) : null,
+      bibliographicPages: bibPageMatch ? Number(bibPageMatch[1]) : null,
+      physicalDescription,
+      isbnPrint,
+      isbnElectronic,
+      publisherText,
+      publisher: publisherText ? 'Universitas Terbuka' : '',
+      city: publisherText.split(':')[0] || '',
+      year: yearMatch ? yearMatch[1] : '',
+      ddc: ddcMatch ? ddcMatch[1] : '',
+      listItems,
+      description
+    };
+    const resolved = resolveCourseCodes({ course, metadata, recommendedForNemo: { fulltextCode: course.modulParam, courseCode: course.code, editionNumber } }, course.modulParam || course.code);
+    return {
+      app: 'Nemo RBV Cover Metadata',
+      version: APP_VERSION,
+      analyzedAt: new Date().toISOString(),
+      pageUrl: location.href,
+      origin: location.origin,
+      course,
+      cover,
+      metadata,
+      recommendedForNemo: {
+        includeCover: Boolean(cover.bestUrl),
+        coverUrl: cover.bestUrl,
+        coverFilename: cover.bestFilename,
+        includeMetadataPage: true,
+        courseCode: resolved.courseCode,
+        editionNumber: resolved.editionNumber,
+        editionCode: resolved.editionCode,
+        fulltextCode: resolved.fulltextCode,
+        subfolder: resolved.subfolder,
+        moduleCode: resolved.fulltextCode,
+        title: course.title,
+        authors: metadata.authors,
+        edition: metadata.edition,
+        sks: metadata.sks,
+        moduleCount: metadata.modules,
+        bibliographicPages: metadata.bibliographicPages,
+        isbnPrint: metadata.isbnPrint,
+        isbnElectronic: metadata.isbnElectronic,
+        year: metadata.year,
+        ddc: metadata.ddc,
+        description: metadata.description
+      }
+    };
+  }
+
+  /** Stores metadata and updates resolver state. */
+  function setCourseMetadata(metadata, source = 'manual') {
+    state.courseMetadata = metadata && typeof metadata === 'object' ? metadata : null;
+    state.config.metadata = state.courseMetadata;
+    state.resolvedCourse = state.courseMetadata ? resolveCourseCodes(state.courseMetadata, state.config.subfolder) : null;
+    renderCourseMetadata();
+    log(state.courseMetadata ? `Metadata RBV dimuat (${source}).` : 'Metadata RBV dikosongkan.');
+    saveConfig();
+  }
+
+  /** Returns the active metadata payload. */
+  function getActiveMetadata() {
+    return state.courseMetadata || state.config.metadata || null;
+  }
+
+  /** Builds a concise human-readable metadata summary. */
+  function buildMetadataSummaryText() {
+    const meta = getActiveMetadata();
+    if (!meta) return 'Belum ada metadata RBV.';
+    const r = resolveCourseCodes(meta, state.config.subfolder);
+    const m = meta.metadata || {};
+    const rec = meta.recommendedForNemo || {};
+    const title = rec.title || (meta.course && meta.course.title) || r.title || '-';
+    const authors = (rec.authors || m.authors || []).join(', ') || '-';
+    const edition = rec.edition || m.edition || (r.editionNumber ? `Edisi ${r.editionNumber}` : '-');
+    return `${r.courseCode || '-'} · ${title} · ${edition}\nKode akses: ${r.fulltextCode || '-'}${r.subfolder ? '/' : ''}\nPenulis: ${authors}`;
+  }
+
+  /** Renders metadata summary in the UI. */
+  function renderCourseMetadata() {
+    const node = state.nodes && state.nodes.metadataSummary;
+    if (node) node.textContent = buildMetadataSummaryText();
+    const resolved = getActiveMetadata() ? resolveCourseCodes(getActiveMetadata(), state.config.subfolder) : null;
+    state.resolvedCourse = resolved;
+  }
+
+  /** Applies metadata-derived access code to the subfolder field. */
+  function applyMetadataSubfolder() {
+    const meta = getActiveMetadata();
+    if (!meta) return alert('Metadata belum tersedia. Ambil dari halaman RBV atau tempel JSON metadata lebih dulu.');
+    const resolved = resolveCourseCodes(meta, state.config.subfolder);
+    if (!resolved.subfolder) return alert('Kode akses tidak bisa ditentukan dari metadata.');
+    if (state.nodes.subfolder) state.nodes.subfolder.value = resolved.subfolder;
+    readConfigFromUi();
+    saveConfig();
+    renderCourseMetadata();
+    setStatus(`Kode akses dipakai: ${resolved.subfolder}`);
+  }
+
+  /** Loads metadata from the current RBV page. */
+  function importMetadataFromPage() {
+    try {
+      const meta = extractRbvMetadataFromPage();
+      if (!meta.course.code && !meta.recommendedForNemo.fulltextCode && !meta.cover.bestUrl) {
+        alert('Metadata RBV tidak terbaca dari halaman ini. Buka halaman detail mata kuliah RBV.');
+        return;
+      }
+      setCourseMetadata(meta, 'halaman');
+      if (!normalizeSubfolder(state.nodes.subfolder ? state.nodes.subfolder.value : state.config.subfolder) && meta.recommendedForNemo.subfolder) applyMetadataSubfolder();
+    } catch (error) {
+      alert(`Gagal membaca metadata: ${String(error && error.message || error)}`);
+    }
+  }
+
+  /** Imports metadata JSON exported by the RBV metadata analyzer. */
+  function importMetadataJson() {
+    const raw = state.nodes.metadataJson ? state.nodes.metadataJson.value.trim() : '';
+    if (!raw) return alert('Tempel JSON metadata terlebih dahulu.');
+    try {
+      const meta = JSON.parse(raw);
+      setCourseMetadata(meta, 'JSON');
+      if (!normalizeSubfolder(state.nodes.subfolder ? state.nodes.subfolder.value : state.config.subfolder) && meta.recommendedForNemo && meta.recommendedForNemo.subfolder) applyMetadataSubfolder();
+    } catch (error) {
+      alert(`JSON metadata tidak valid: ${String(error && error.message || error)}`);
+    }
+  }
+
+  /** Builds metadata JSON and README files for ZIP outputs. */
+  async function buildMetadataFiles(prefix = '00_Metadata/') {
+    if (!state.config.includeMetadata && !state.config.includeCover) return [];
+    const meta = getActiveMetadata();
+    if (!meta) return [];
+    const files = [];
+    const resolved = resolveCourseCodes(meta, state.config.subfolder);
+    const payload = { ...meta, resolvedForNemo: resolved, exportedAt: new Date().toISOString() };
+    if (state.config.includeMetadata) {
+      files.push({ name: `${prefix}metadata.json`, text: JSON.stringify(payload, null, 2) });
+      files.push({ name: `${prefix}README.md`, text: buildMetadataReadme(meta, resolved) });
+    }
+    if (state.config.includeCover) {
+      const cover = await fetchCoverBlob(meta).catch(() => null);
+      if (cover && cover.blob) files.push({ name: `${prefix}${safeName(cover.filename || 'cover.jpg', 'cover.jpg')}`, blob: cover.blob });
+    }
+    return files;
+  }
+
+  /** Builds README text from course metadata. */
+  function buildMetadataReadme(meta, resolved = null) {
+    const rec = meta.recommendedForNemo || {};
+    const m = meta.metadata || {};
+    const course = meta.course || {};
+    const r = resolved || resolveCourseCodes(meta, state.config.subfolder);
+    const title = rec.title || course.title || '';
+    const authors = (rec.authors || m.authors || []).join(', ');
+    const lines = [
+      `# ${r.courseCode || ''}${title ? ' - ' + title : ''}`.trim(),
+      '',
+      authors ? `Penulis: ${authors}` : '',
+      rec.edition || m.edition || r.editionNumber ? `Edisi: ${rec.edition || m.edition || ('Edisi ' + r.editionNumber)}` : '',
+      rec.sks || m.sks ? `SKS: ${rec.sks || m.sks}` : '',
+      rec.moduleCount || m.modules ? `Jumlah modul: ${rec.moduleCount || m.modules}` : '',
+      rec.bibliographicPages || m.bibliographicPages ? `Halaman bibliografi: ${rec.bibliographicPages || m.bibliographicPages}` : '',
+      rec.isbnPrint || m.isbnPrint ? `ISBN: ${rec.isbnPrint || m.isbnPrint}` : '',
+      rec.isbnElectronic || m.isbnElectronic ? `ISBN (E): ${rec.isbnElectronic || m.isbnElectronic}` : '',
+      rec.year || m.year ? `Tahun: ${rec.year || m.year}` : '',
+      rec.ddc || m.ddc ? `DDC: ${rec.ddc || m.ddc}` : '',
+      rec.coverUrl ? `Cover: ${rec.coverUrl}` : '',
+      rec.fulltextCode || r.fulltextCode ? `Kode akses: ${rec.fulltextCode || r.fulltextCode}` : '',
+      '',
+      '## Deskripsi',
+      '',
+      rec.description || m.description || ''
+    ].filter(line => line !== null && line !== undefined);
+    return lines.join('\n').replace(/\n{4,}/g, '\n\n\n');
+  }
+
+  /** Fetches the selected cover image as a blob. */
+  async function fetchCoverBlob(meta = null) {
+    const data = meta || getActiveMetadata();
+    const rec = data && data.recommendedForNemo || {};
+    const cover = data && data.cover || {};
+    const url = rec.coverUrl || cover.bestUrl || (cover.best && cover.best.src) || '';
+    if (!url) return null;
+    if (state.coverBlobCache.has(url)) return state.coverBlobCache.get(url);
+    const response = await fetch(url, { credentials: 'include', cache: 'force-cache' });
+    if (!response.ok) throw new Error(`Cover HTTP ${response.status}`);
+    const blob = await response.blob();
+    if (!/^image\//i.test(blob.type || response.headers.get('content-type') || '')) throw new Error('Cover bukan gambar');
+    const filename = rec.coverFilename || cover.bestFilename || (() => { try { return decodeURIComponent(new URL(url).pathname.split('/').pop() || 'cover.jpg'); } catch { return 'cover.jpg'; } })();
+    const out = { url, filename, blob };
+    state.coverBlobCache.set(url, out);
+    return out;
+  }
+
+  /** Returns a metadata heading for text exports. */
+  function metadataTextBlock(format = 'txt') {
+    const meta = getActiveMetadata();
+    if (!state.config.includeMetadata || !meta) return '';
+    const r = resolveCourseCodes(meta, state.config.subfolder);
+    const m = meta.metadata || {};
+    const rec = meta.recommendedForNemo || {};
+    const title = rec.title || (meta.course && meta.course.title) || '';
+    const authors = (rec.authors || m.authors || []).join(', ');
+    if (format === 'md') return buildMetadataReadme(meta, r) + '\n\n---\n\n';
+    return [
+      `${r.courseCode || ''}${title ? ' - ' + title : ''}`.trim(),
+      authors ? `Penulis: ${authors}` : '',
+      rec.edition || m.edition ? `Edisi: ${rec.edition || m.edition}` : '',
+      r.fulltextCode ? `Kode akses: ${r.fulltextCode}` : '',
+      rec.description || m.description ? `Deskripsi: ${rec.description || m.description}` : '',
+      ''
+    ].filter(Boolean).join('\n') + '\n';
   }
 
   /** Returns candidate doc parameter variants for view.php. */
@@ -905,142 +1294,6 @@
     }
   }
 
-  /** Adds a document name to the manual input if it is not already present. */
-  function addDocToManualInput(docName) {
-    const doc = toDisplayDoc(docName);
-    if (!doc || !state.nodes.manualDocs) return;
-    const current = String(state.nodes.manualDocs.value || '');
-    const docs = parseManualDocs(current, state.config.subfolder).map(d => d.toLowerCase());
-    if (!docs.includes(doc.toLowerCase())) {
-      state.nodes.manualDocs.value = current.trim() ? `${current.trim()}\n${doc}` : doc;
-      readConfigFromUi();
-      saveConfig();
-    }
-  }
-
-  /** Tests a single pasted reader link and records its exact diagnostic result. */
-  async function testManualLink() {
-    if (state.running) return;
-    readConfigFromUi();
-    const raw = state.nodes.testLink ? state.nodes.testLink.value : '';
-    const parsed = parseReaderLink(raw);
-    if (!parsed || !parsed.doc || !parsed.subfolder) {
-      alert('Tempel link reader yang berisi subfolder dan doc.');
-      return;
-    }
-
-    state.running = true;
-    state.stopRequested = false;
-    state.controller = new AbortController();
-    state.readerInitCache.clear();
-    updateButtons();
-    setStatus(`Menguji link ${parsed.doc}...`);
-    log(`Uji link manual: ${parsed.subfolder} ${parsed.doc}.`);
-
-    const oldSubfolder = state.config.subfolder;
-    const oldInputValue = state.nodes.subfolder ? state.nodes.subfolder.value : oldSubfolder;
-    const cache = new Map();
-    const started = Date.now();
-    let output;
-    try {
-      state.config.subfolder = parsed.subfolder;
-      if (state.nodes.subfolder) state.nodes.subfolder.value = parsed.subfolder;
-      const first = await probePngPage(parsed.doc, 1, cache, parsed.serviceDoc);
-      if (first.exists) {
-        const count = await countPages(parsed.doc, first, cache);
-        const meta = classifyDocument(parsed.doc);
-        output = {
-          testedAt: new Date().toISOString(),
-          valid: true,
-          link: parsed.href,
-          subfolder: parsed.subfolder,
-          doc: parsed.doc,
-          serviceDoc: first.serviceDocUsed || parsed.serviceDoc,
-          label: meta.label,
-          group: meta.group,
-          pages: count.pages,
-          width: first.width,
-          height: first.height,
-          status: first.status,
-          note: count.capped ? `Mencapai batas ${state.config.maxPage}` : 'Tersedia',
-          countMethod: count.method,
-          jsonHint: count.jsonHint || null,
-          triedServiceDocs: first.triedServiceDocs || [],
-          initSession: first.initSession || null,
-          elapsedMs: Date.now() - started
-        };
-        addDocToManualInput(parsed.doc);
-        setStatus(`Link valid. ${parsed.doc} terdeteksi ${count.pages} halaman.`);
-        log(`Link manual valid: ${parsed.doc}, ${count.pages} halaman.`);
-      } else {
-        output = {
-          testedAt: new Date().toISOString(),
-          valid: false,
-          link: parsed.href,
-          subfolder: parsed.subfolder,
-          doc: parsed.doc,
-          serviceDoc: parsed.serviceDoc,
-          pages: 0,
-          width: null,
-          height: null,
-          status: first.status,
-          note: first.note || 'Tidak ditemukan',
-          triedServiceDocs: first.triedServiceDocs || [],
-          initSession: first.initSession || null,
-          elapsedMs: Date.now() - started
-        };
-        setStatus(`Link belum valid: ${parsed.doc} (${output.note}).`, true);
-        log(`Link manual belum valid: ${parsed.doc} (${output.note}).`);
-      }
-    } catch (error) {
-      output = {
-        testedAt: new Date().toISOString(),
-        valid: false,
-        link: parsed.href,
-        subfolder: parsed.subfolder,
-        doc: parsed.doc,
-        serviceDoc: parsed.serviceDoc,
-        pages: 0,
-        status: null,
-        note: String(error && error.message || error),
-        elapsedMs: Date.now() - started
-      };
-      setStatus(`Uji link gagal: ${output.note}`, true);
-      log(`Uji link gagal: ${output.note}`);
-    } finally {
-      state.config.subfolder = parsed.subfolder || oldSubfolder;
-      if (state.nodes.subfolder) state.nodes.subfolder.value = parsed.subfolder || oldInputValue;
-      state.running = false;
-      state.stopRequested = false;
-      state.controller = null;
-      if (output) {
-        state.linkTests.unshift(output);
-        state.linkTests = state.linkTests.slice(0, 20);
-        renderLinkTests();
-      }
-      readConfigFromUi();
-      saveConfig();
-      updateButtons();
-    }
-  }
-
-  /** Renders manual link diagnostic results. */
-  function renderLinkTests() {
-    const box = state.nodes.linkTests;
-    if (!box) return;
-    if (!state.linkTests.length) {
-      box.innerHTML = '<div class="nss-empty-mini">Belum ada uji link manual.</div>';
-      return;
-    }
-    box.innerHTML = state.linkTests.slice(0, 5).map(item => {
-      const status = item.valid ? 'Valid' : 'Gagal';
-      const details = item.valid
-        ? `${item.pages || 0} halaman · ${item.width || '-'}×${item.height || '-'} · doc=${item.serviceDoc || '-'}`
-        : `${item.note || 'Tidak ditemukan'} · doc=${item.serviceDoc || '-'}`;
-      return `<div class="nss-linktest ${item.valid ? 'ok' : 'bad'}"><strong>${escapeHtml(status)} · ${escapeHtml(item.doc || '-')}</strong><span>${escapeHtml(details)}</span></div>`;
-    }).join('');
-  }
-
   /** Runs the scan. */
   async function runScan() {
     if (state.running) return;
@@ -1049,7 +1302,7 @@
 
     const subfolder = normalizeSubfolder(state.config.subfolder);
     if (!subfolder) {
-      alert('Isi subfolder terlebih dahulu. Contoh: EKSI441604/');
+      alert('Isi kode akses / subfolder terlebih dahulu. Contoh: EKSI441604/ atau EKMA431404/');
       return;
     }
 
@@ -1117,12 +1370,10 @@
   /** Reads UI values into config. */
   function readConfigFromUi() {
     const n = state.nodes;
-    state.config.subfolder = normalizeSubfolder(n.subfolder.value);
+    state.config.subfolder = resolveInputSubfolder(n.subfolder.value);
     state.config.patternPresetKeys = checkedPatternPresetKeys();
     state.config.customPatterns = n.customPatterns ? n.customPatterns.value : '';
     state.config.patterns = buildEffectivePatternString(state.config);
-    state.config.manualDocs = '';
-    state.config.testLink = '';
     state.config.useDirectProbe = true;
     state.config.initReaderBeforeProbe = n.initReaderBeforeProbe ? Boolean(n.initReaderBeforeProbe.checked) : true;
     state.config.usePageLinks = false;
@@ -1135,7 +1386,44 @@
     if (n.outputBundleRadios) state.config.outputBundle = (n.outputBundleRadios.find(input => input.checked) || {}).value || DEFAULTS.outputBundle;
     if (state.config.outputFormat === 'png') state.config.outputBundle = 'zip';
     state.config.pdfSearchable = isPdfSearchableSelected();
+    state.config.includeCover = n.includeCover ? Boolean(n.includeCover.checked) : true;
+    state.config.includeMetadata = n.includeMetadata ? Boolean(n.includeMetadata.checked) : true;
+    state.config.includeIdentityPage = n.includeIdentityPage ? Boolean(n.includeIdentityPage.checked) : true;
     state.config.compact = state.ui.classList.contains('nss-compact');
+    state.config.minimized = state.ui.classList.contains('nss-minimized');
+  }
+
+
+  /** Updates the minimized bubble label. */
+  function updateMiniBubble() {
+    const node = state.nodes && state.nodes.miniBubbleText;
+    if (!node) return;
+    const valid = state.results.filter(item => item.valid).length;
+    const pages = state.results.filter(item => item.valid).reduce((sum, item) => sum + Number(item.pages || 0), 0);
+    if (state.running) node.textContent = 'Nemo bekerja';
+    else if (valid) node.textContent = `Nemo · ${valid} dokumen · ${pages} halaman`;
+    else node.textContent = 'Nemo';
+  }
+
+  /** Minimizes the Nemo panel into a small floating bubble. */
+  function minimizeUi() {
+    if (!state.ui) return;
+    state.ui.classList.add('nss-minimized');
+    state.config.minimized = true;
+    updateMiniBubble();
+    saveConfig();
+  }
+
+  /** Restores the full Nemo panel from the minimized bubble. */
+  function restoreUi() {
+    if (!state.ui) {
+      buildUi();
+      return;
+    }
+    state.ui.classList.remove('nss-minimized');
+    state.config.minimized = false;
+    updateMiniBubble();
+    saveConfig();
   }
 
   /** Sets status text. */
@@ -1143,6 +1431,7 @@
     if (!state.nodes.status) return;
     state.nodes.status.textContent = message;
     state.nodes.status.classList.toggle('is-error', Boolean(isError));
+    updateMiniBubble();
   }
 
   /** Updates main buttons. */
@@ -1158,7 +1447,8 @@
     if (n.txtSelectedBtn) n.txtSelectedBtn.disabled = state.running || !selectedResults().length;
     if (n.mdSelectedBtn) n.mdSelectedBtn.disabled = state.running || !selectedResults().length;
     n.clearBtn.disabled = state.running || !state.results.length;
-    if (n.testLinkBtn) n.testLinkBtn.disabled = state.running;
+    if (state.ui) state.ui.classList.toggle('nss-running', Boolean(state.running));
+    updateMiniBubble();
   }
 
   /** Escapes HTML. */
@@ -1246,6 +1536,7 @@
       });
     });
     updateButtons();
+    updateMiniBubble();
   }
 
   /** Renders logs. */
@@ -1489,6 +1780,7 @@
       log(`Mulai unduh ${result.doc}.`);
       const bundle = await collectPngEntriesForDocument(result, folder, 0, 1);
       if (!bundle.manifest.downloadedPages) throw new Error('Tidak ada halaman yang berhasil diambil.');
+      bundle.files.unshift(...await buildMetadataFiles('00_Metadata/'));
       const zip = await createZip(bundle.files);
       const safeSubfolder = safeName(normalizeSubfolder(state.config.subfolder).replace(/\/+$/g, ''), 'subfolder');
       const filename = `${safeSubfolder}-${safeName(result.doc.replace(/\.pdf$/i, ''))}-png.zip`;
@@ -1533,6 +1825,7 @@
         allFiles.push(...bundle.files);
         manifests.push(bundle.manifest);
       }
+      allFiles.unshift(...await buildMetadataFiles('00_Metadata/'));
       allFiles.push({ name: 'manifest.json', text: JSON.stringify({
         app: 'Nemo Subfolder Studio Downloader',
         version: APP_VERSION,
@@ -1758,7 +2051,10 @@
   /** Builds plain text for one document. */
   function buildPlainText(result, nativeBundle) {
     const pages = nativeBundle && nativeBundle.pages ? nativeBundle.pages : [];
-    const out = [`${result.label} - ${result.doc}`, `Subfolder: ${normalizeSubfolder(state.config.subfolder)}`, `Halaman: ${result.pages || 0}`, ''];
+    const out = [];
+    const metaBlock = metadataTextBlock('txt');
+    if (metaBlock) out.push(metaBlock.trim(), '');
+    out.push(`${result.label} - ${result.doc}`, `Subfolder: ${normalizeSubfolder(state.config.subfolder)}`, `Halaman: ${result.pages || 0}`, '');
     for (const page of pages) {
       out.push(`===== Halaman ${page.page} =====`);
       const lines = nativePageToLines(page);
@@ -1772,7 +2068,10 @@
   /** Builds Markdown for one document. */
   function buildMarkdown(result, nativeBundle) {
     const pages = nativeBundle && nativeBundle.pages ? nativeBundle.pages : [];
-    const out = [`# ${result.label}`, '', `- Dokumen: ${result.doc}`, `- Subfolder: ${normalizeSubfolder(state.config.subfolder)}`, `- Halaman: ${result.pages || 0}`, ''];
+    const out = [];
+    const metaBlock = metadataTextBlock('md');
+    if (metaBlock) out.push(metaBlock.trim(), '');
+    out.push(`# ${result.label}`, '', `- Dokumen: ${result.doc}`, `- Subfolder: ${normalizeSubfolder(state.config.subfolder)}`, `- Halaman: ${result.pages || 0}`, '');
     for (const page of pages) {
       out.push(`## Halaman ${page.page}`, '');
       const lines = nativePageToLines(page);
@@ -1996,6 +2295,33 @@
       .map(item => ({ page: item.page, blob: item.blob, textPage: textByPage.get(item.page) || null }));
   }
 
+
+  /** Wraps a text line for simple PDF front matter pages. */
+  function wrapPlainLine(text, max = 78) {
+    const words = String(text || '').split(/\s+/).filter(Boolean);
+    const lines = [];
+    let line = '';
+    for (const word of words) {
+      if ((line + ' ' + word).trim().length > max && line) {
+        lines.push(line);
+        line = word;
+      } else {
+        line = (line + ' ' + word).trim();
+      }
+    }
+    if (line) lines.push(line);
+    return lines;
+  }
+
+  /** Builds PDF front matter options from active metadata. */
+  async function buildPdfFrontMatter(mode = 'combined', items = []) {
+    if (!state.config.includeIdentityPage) return null;
+    const meta = getActiveMetadata();
+    if (!meta) return null;
+    const cover = state.config.includeCover ? await fetchCoverBlob(meta).catch(() => null) : null;
+    return { mode, items, metadata: meta, coverBlob: cover ? cover.blob : null, coverFilename: cover ? cover.filename : '' };
+  }
+
   /** Builds a PDF from ordered page records. Text is included only when searchable is true. */
   async function createPdfFromPageRecords(pageRecords, options = {}) {
     const searchable = options.searchable !== false;
@@ -2009,6 +2335,81 @@
     setObj(fontId, '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>');
 
     const pageIds = [];
+
+    const addTextPage = async (frontMatter) => {
+      if (!frontMatter || !frontMatter.metadata) return;
+      const meta = frontMatter.metadata;
+      const rec = meta.recommendedForNemo || {};
+      const md = meta.metadata || {};
+      const course = meta.course || {};
+      const resolved = resolveCourseCodes(meta, state.config.subfolder);
+      const pageW = 595.28;
+      const pageH = 841.89;
+      const pageId = reserve();
+      const contentId = reserve();
+      let xobjectText = '';
+      let coverResource = '';
+      const commands = ['BT', '/F1 22 Tf', '0 Tr', `1 0 0 1 54 790 Tm`, `(${pdfString((resolved.courseCode || '') + (rec.title || course.title ? ' - ' + (rec.title || course.title) : ''))}) Tj`, 'ET'];
+      let y = 755;
+      const lines = [
+        (rec.authors || md.authors || []).length ? `Penulis: ${(rec.authors || md.authors || []).join(', ')}` : '',
+        rec.edition || md.edition || resolved.editionNumber ? `Edisi: ${rec.edition || md.edition || ('Edisi ' + resolved.editionNumber)}` : '',
+        rec.sks || md.sks ? `SKS: ${rec.sks || md.sks}` : '',
+        rec.moduleCount || md.modules ? `Jumlah modul: ${rec.moduleCount || md.modules}` : '',
+        rec.bibliographicPages || md.bibliographicPages ? `Halaman bibliografi: ${rec.bibliographicPages || md.bibliographicPages}` : '',
+        rec.isbnPrint || md.isbnPrint ? `ISBN: ${rec.isbnPrint || md.isbnPrint}` : '',
+        rec.isbnElectronic || md.isbnElectronic ? `ISBN (E): ${rec.isbnElectronic || md.isbnElectronic}` : '',
+        rec.year || md.year ? `Tahun: ${rec.year || md.year}` : '',
+        rec.ddc || md.ddc ? `DDC: ${rec.ddc || md.ddc}` : '',
+        resolved.fulltextCode ? `Kode akses: ${resolved.fulltextCode}` : ''
+      ].filter(Boolean);
+      for (const line of lines) {
+        commands.push('BT', '/F1 11 Tf', `1 0 0 1 54 ${pdfNum(y)} Tm`, `(${pdfString(line)}) Tj`, 'ET');
+        y -= 17;
+      }
+      const desc = rec.description || md.description || '';
+      if (desc) {
+        y -= 12;
+        commands.push('BT', '/F1 13 Tf', `1 0 0 1 54 ${pdfNum(y)} Tm`, '(Deskripsi) Tj', 'ET');
+        y -= 18;
+        for (const line of wrapPlainLine(desc, 88).slice(0, 12)) {
+          commands.push('BT', '/F1 10 Tf', `1 0 0 1 54 ${pdfNum(y)} Tm`, `(${pdfString(line)}) Tj`, 'ET');
+          y -= 14;
+        }
+      }
+      if (frontMatter.coverBlob) {
+        try {
+          const imageId = reserve();
+          const bytes = await blobToBytes(frontMatter.coverBlob);
+          let image;
+          let imageDict;
+          try {
+            image = parsePngForPdf(bytes);
+            imageDict = `<< /Type /XObject /Subtype /Image /Width ${image.width} /Height ${image.height} /ColorSpace ${image.colorSpace} /BitsPerComponent 8 /Filter /FlateDecode /DecodeParms << /Predictor 15 /Colors ${image.colors} /BitsPerComponent 8 /Columns ${image.width} >> /Length ${image.stream.length} >>`;
+          } catch {
+            image = await convertImageBlobToJpegForPdf(frontMatter.coverBlob);
+            imageDict = `<< /Type /XObject /Subtype /Image /Width ${image.width} /Height ${image.height} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${image.stream.length} >>`;
+          }
+          setObj(imageId, [imageDict, '\nstream\n', image.stream, '\nendstream']);
+          const maxW = 170;
+          const maxH = 230;
+          const ratio = Math.min(maxW / image.width, maxH / image.height, 1);
+          const w = image.width * ratio;
+          const h = image.height * ratio;
+          const x = pageW - w - 54;
+          const yImg = 540;
+          commands.unshift(`q\n${pdfNum(w)} 0 0 ${pdfNum(h)} ${pdfNum(x)} ${pdfNum(yImg)} cm\n/Cover1 Do\nQ`);
+          coverResource = `/XObject << /Cover1 ${imageId} 0 R >>`;
+        } catch { }
+      }
+      const contentBytes = encoder.encode(commands.join('\n') + '\n');
+      setObj(contentId, [`<< /Length ${contentBytes.length} >>\nstream\n`, contentBytes, '\nendstream']);
+      setObj(pageId, `<< /Type /Page /Parent ${pagesId} 0 R /MediaBox [0 0 ${pageW} ${pageH}] /Resources << ${coverResource} /Font << /F1 ${fontId} 0 R >> >> /Contents ${contentId} 0 R >>`);
+      pageIds.push(pageId);
+    };
+
+    if (options.frontMatter) await addTextPage(options.frontMatter);
+
     for (const record of pageRecords || []) {
       if (!record || !record.blob) continue;
       const imageId = reserve();
@@ -2062,7 +2463,7 @@
   /** Builds a searchable PDF from PNG pages and native text when available. */
   async function createSearchablePdf(result, imageItems, nativeBundle, options = {}) {
     const records = makePdfPageRecords(imageItems, nativeBundle);
-    return createPdfFromPageRecords(records, { searchable: options.searchable !== false });
+    return createPdfFromPageRecords(records, { searchable: options.searchable !== false, frontMatter: options.frontMatter || null });
   }
 
   /** Collects image pages only, without ZIP entry wrapping. */
@@ -2103,7 +2504,7 @@
       const nativeBundle = searchable ? await collectNativeTextForDocument(result) : { pages: [], offsetInfo: null };
       const images = await collectPngBlobsForDocument(result, 0, 1);
       if (!images.items.length) throw new Error('Tidak ada halaman gambar yang berhasil diambil.');
-      const pdf = await createSearchablePdf(result, images.items, nativeBundle, { searchable });
+      const pdf = await createSearchablePdf(result, images.items, nativeBundle, { searchable, frontMatter: await buildPdfFrontMatter('single', [result]) });
       const safeSubfolder = safeName(normalizeSubfolder(state.config.subfolder).replace(/\/+$/g, ''), 'subfolder');
       const suffix = searchable ? '' : '-gambar-saja';
       downloadBlob(pdf, `${safeSubfolder}-${safeName(result.doc.replace(/\.pdf$/i, ''))}${suffix}.pdf`);
@@ -2167,12 +2568,13 @@
         const nativeBundle = searchable ? await collectNativeTextForDocument(result) : { pages: [], offsetInfo: null };
         const images = await collectPngBlobsForDocument(result, i, items.length);
         if (images.items.length) {
-          const pdf = await createSearchablePdf(result, images.items, nativeBundle, { searchable });
+          const pdf = await createSearchablePdf(result, images.items, nativeBundle, { searchable, frontMatter: await buildPdfFrontMatter('single', [result]) });
           const suffix = searchable ? '' : '-gambar-saja';
           files.push({ name: `${folder}/${safeName(result.doc.replace(/\.pdf$/i, ''))}${suffix}.pdf`, blob: pdf });
         }
         files.push({ name: `${folder}/status.json`, text: JSON.stringify({ doc: result.doc, searchable, nativeTextPages: nativeBundle.pages.length, pages: result.pages, imagePages: images.items.length, failedImages: images.failures, offsetInfo: nativeBundle.offsetInfo || null }, null, 2) });
       }
+      files.unshift(...await buildMetadataFiles('00_Metadata/'));
       if (!files.some(file => /\.pdf$/i.test(file.name))) throw new Error('Tidak ada PDF yang berhasil dibuat.');
       const zip = await createZip(files);
       const safeSubfolder = safeName(normalizeSubfolder(state.config.subfolder).replace(/\/+$/g, ''), 'subfolder');
@@ -2213,7 +2615,7 @@
         manifest.push({ doc: result.doc, label: result.label, pages: result.pages, imagePages: images.items.length, failedImages: images.failures, nativeTextPages: nativeBundle.pages.length });
       }
       if (!records.length) throw new Error('Tidak ada halaman gambar yang berhasil diambil.');
-      const pdf = await createPdfFromPageRecords(records, { searchable });
+      const pdf = await createPdfFromPageRecords(records, { searchable, frontMatter: await buildPdfFrontMatter('combined', items) });
       const safeSubfolder = safeName(normalizeSubfolder(state.config.subfolder).replace(/\/+$/g, ''), 'subfolder');
       downloadBlob(pdf, `${safeSubfolder}-${searchable ? 'gabungan-searchable' : 'gabungan-gambar-saja'}.pdf`);
       const pages = records.length;
@@ -2251,6 +2653,7 @@
         files.push({ name: `${folder}/${safeName(result.doc.replace(/\.pdf$/i, ''))}.${format === 'md' ? 'md' : 'txt'}`, text: content });
         files.push({ name: `${folder}/text-status.json`, text: JSON.stringify({ doc: result.doc, nativeTextPages: nativeBundle.pages.length, pages: result.pages, offsetInfo: nativeBundle.offsetInfo }, null, 2) });
       }
+      files.unshift(...await buildMetadataFiles('00_Metadata/'));
       const zip = await createZip(files);
       const safeSubfolder = safeName(normalizeSubfolder(state.config.subfolder).replace(/\/+$/g, ''), 'subfolder');
       downloadBlob(zip, `${safeSubfolder}-${format === 'md' ? 'markdown' : 'txt'}-terpilih.zip`);
@@ -2290,7 +2693,9 @@
         }
         if (Number(state.config.delayMs) > 0) await sleep(Math.min(250, Number(state.config.delayMs)));
       }
-      const combined = format === 'md' ? parts.join('\n\n---\n\n') : parts.join('\n\n==============================\n\n');
+      const intro = metadataTextBlock(format).trim();
+      const combinedBody = format === 'md' ? parts.join('\n\n---\n\n') : parts.join('\n\n==============================\n\n');
+      const combined = intro ? `${intro}\n\n${combinedBody}` : combinedBody;
       const blob = new Blob([combined], { type: format === 'md' ? 'text/markdown;charset=utf-8' : 'text/plain;charset=utf-8' });
       const safeSubfolder = safeName(normalizeSubfolder(state.config.subfolder).replace(/\/+$/g, ''), 'subfolder');
       downloadBlob(blob, `${safeSubfolder}-gabungan.${format === 'md' ? 'md' : 'txt'}`);
@@ -2368,8 +2773,9 @@
         failedCandidates: state.results.filter(r => !r.valid).length
       },
       results: state.results,
-      linkTests: state.linkTests,
       downloadStats: state.downloadStats,
+      courseMetadata: getActiveMetadata(),
+      resolvedCourse: getActiveMetadata() ? resolveCourseCodes(getActiveMetadata(), state.config.subfolder) : null,
       logs: state.logs
     };
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
@@ -2413,14 +2819,15 @@
     const ui = document.createElement('section');
     ui.id = UI_ID;
     ui.dataset.nemoUi = 'true';
-    ui.className = state.config.compact ? 'nss-compact' : '';
+    ui.className = [state.config.compact ? 'nss-compact' : '', state.config.minimized ? 'nss-minimized' : ''].filter(Boolean).join(' ');
     ui.innerHTML = `
       <header class="nss-header">
         <div class="nss-brand">
           <strong>Nemo Capture Studio</strong>
-          <span>Subfolder · v1.3.4</span>
+          <span>Metadata · v1.4.0</span>
         </div>
         <div class="nss-head-actions">
+          <button type="button" data-nss="minimize">Mini</button>
           <button type="button" data-nss="compact">${state.config.compact ? 'Detail' : 'Ringkas'}</button>
           <button type="button" data-nss="hide">Tutup</button>
         </div>
@@ -2438,8 +2845,8 @@
 
         <div class="nss-card nss-main">
           <div class="nss-step"><b>1</b><span>Mata kuliah</span></div>
-          <label>Subfolder</label>
-          <input data-nss="subfolder" placeholder="Contoh: EKSI441604/">
+          <label>Kode akses / subfolder</label>
+          <input data-nss="subfolder" placeholder="Contoh: EKSI441604/ atau EKMA431404/">
           <label>Pola dokumen awal</label>
           <div class="nss-pattern-presets nss-pattern-front">${renderPatternPresetOptions(state.config)}</div>
           <p class="nss-note">Fokus awal: DAFIS, TINJAUAN, dan M1 sampai M12. Tambahkan pola khusus di Pengaturan pencarian bila perlu.</p>
@@ -2448,6 +2855,26 @@
             <button type="button" class="danger" data-nss="stop">Stop</button>
             <button type="button" data-nss="export">JSON</button>
           </div>
+        </div>
+
+        <div class="nss-card nss-metadata-card">
+          <div class="nss-step"><b>i</b><span>Cover dan metadata</span></div>
+          <pre class="nss-meta-summary" data-nss="metadataSummary">Belum ada metadata RBV.</pre>
+          <div class="nss-actions">
+            <button type="button" data-nss="readMetadata">Ambil dari halaman ini</button>
+            <button type="button" data-nss="applyMetadataSubfolder">Pakai kode akses</button>
+            <button type="button" data-nss="clearMetadata">Hapus metadata</button>
+          </div>
+          <div class="nss-checks nss-metadata-checks">
+            <label><input type="checkbox" data-nss="includeCover"> Sertakan cover</label>
+            <label><input type="checkbox" data-nss="includeMetadata"> Sertakan metadata</label>
+            <label><input type="checkbox" data-nss="includeIdentityPage"> Halaman identitas PDF</label>
+          </div>
+          <details class="nss-metadata-json">
+            <summary>Import JSON metadata</summary>
+            <textarea data-nss="metadataJson" placeholder="Tempel JSON dari Nemo RBV Cover Metadata Analyzer bila tidak berada di halaman RBV."></textarea>
+            <div class="nss-inline-actions"><button type="button" data-nss="importMetadataJson">Import JSON</button></div>
+          </details>
         </div>
 
         <div class="nss-card nss-save-card">
@@ -2515,17 +2942,23 @@
 
         <details class="nss-logbox"><summary>Aktivitas</summary><pre data-nss="logs">Belum ada aktivitas.</pre></details>
       </div>
+      <button type="button" class="nss-mini-bubble" data-nss="restore" title="Buka Nemo"><span class="nss-mini-dot"></span><span data-nss="miniBubbleText">Nemo</span></button>
     `;
     document.documentElement.appendChild(ui);
     state.ui = ui;
     state.nodes = {
       subfolder: ui.querySelector('[data-nss="subfolder"]'),
       customPatterns: ui.querySelector('[data-nss="customPatterns"]'),
+      metadataSummary: ui.querySelector('[data-nss="metadataSummary"]'),
+      readMetadataBtn: ui.querySelector('[data-nss="readMetadata"]'),
+      applyMetadataSubfolderBtn: ui.querySelector('[data-nss="applyMetadataSubfolder"]'),
+      clearMetadataBtn: ui.querySelector('[data-nss="clearMetadata"]'),
+      includeCover: ui.querySelector('[data-nss="includeCover"]'),
+      includeMetadata: ui.querySelector('[data-nss="includeMetadata"]'),
+      includeIdentityPage: ui.querySelector('[data-nss="includeIdentityPage"]'),
+      metadataJson: ui.querySelector('[data-nss="metadataJson"]'),
+      importMetadataJsonBtn: ui.querySelector('[data-nss="importMetadataJson"]'),
       patternPresetChecks: Array.from(ui.querySelectorAll('[data-nss-pattern-key]')),
-      manualDocs: null,
-      testLink: null,
-      testLinkBtn: null,
-      linkTests: null,
       usePatterns: null,
       initReaderBeforeProbe: ui.querySelector('[data-nss="initReaderBeforeProbe"]'),
       usePageLinks: null,
@@ -2551,17 +2984,20 @@
       status: ui.querySelector('[data-nss="status"]'),
       summary: ui.querySelector('[data-nss="summary"]'),
       resultBody: ui.querySelector('[data-nss="resultBody"]'),
-      logs: ui.querySelector('[data-nss="logs"]')
+      logs: ui.querySelector('[data-nss="logs"]'),
+      minimizeBtn: ui.querySelector('[data-nss="minimize"]'),
+      restoreBtn: ui.querySelector('[data-nss="restore"]'),
+      miniBubbleText: ui.querySelector('[data-nss="miniBubbleText"]')
     };
 
     const n = state.nodes;
     n.subfolder.value = state.config.subfolder || inferSubfolderFromLocation();
     state.config = normalizePatternConfig(state.config);
+    state.courseMetadata = state.config.metadata || null;
+    state.resolvedCourse = state.courseMetadata ? resolveCourseCodes(state.courseMetadata, state.config.subfolder) : null;
     n.customPatterns.value = state.config.customPatterns || '';
     for (const input of n.patternPresetChecks) input.checked = state.config.patternPresetKeys.includes(input.getAttribute('data-nss-pattern-key'));
     n.initReaderBeforeProbe.checked = state.config.initReaderBeforeProbe !== false;
-    state.config.manualDocs = '';
-    state.config.testLink = '';
     state.config.usePatterns = true;
     state.config.usePageLinks = false;
     n.maxPage.value = state.config.maxPage;
@@ -2571,13 +3007,23 @@
     for (const input of n.outputFormatRadios) input.checked = input.value === (state.config.outputFormat || DEFAULTS.outputFormat);
     for (const input of n.outputBundleRadios) input.checked = input.value === (state.config.outputBundle || DEFAULTS.outputBundle);
     for (const input of n.pdfSearchableRadios) input.checked = input.value === (state.config.pdfSearchable === false ? 'no' : 'yes');
+    if (n.includeCover) n.includeCover.checked = state.config.includeCover !== false;
+    if (n.includeMetadata) n.includeMetadata.checked = state.config.includeMetadata !== false;
+    if (n.includeIdentityPage) n.includeIdentityPage.checked = state.config.includeIdentityPage !== false;
+    renderCourseMetadata();
 
     n.scanBtn.addEventListener('click', runScan);
     n.stopBtn.addEventListener('click', stopScan);
     n.exportBtn.addEventListener('click', exportJson);
     n.downloadModeBtn.addEventListener('click', runSelectedDownloadMode);
     n.clearBtn.addEventListener('click', clearResults);
+    if (n.readMetadataBtn) n.readMetadataBtn.addEventListener('click', importMetadataFromPage);
+    if (n.applyMetadataSubfolderBtn) n.applyMetadataSubfolderBtn.addEventListener('click', applyMetadataSubfolder);
+    if (n.clearMetadataBtn) n.clearMetadataBtn.addEventListener('click', () => setCourseMetadata(null, 'hapus'));
+    if (n.importMetadataJsonBtn) n.importMetadataJsonBtn.addEventListener('click', importMetadataJson);
     ui.querySelector('[data-nss="hide"]').addEventListener('click', () => ui.remove());
+    if (n.minimizeBtn) n.minimizeBtn.addEventListener('click', minimizeUi);
+    if (n.restoreBtn) n.restoreBtn.addEventListener('click', restoreUi);
     ui.querySelector('[data-nss="compact"]').addEventListener('click', event => {
       ui.classList.toggle('nss-compact');
       event.currentTarget.textContent = ui.classList.contains('nss-compact') ? 'Detail' : 'Ringkas';
@@ -2589,14 +3035,13 @@
       node.addEventListener('change', () => { readConfigFromUi(); saveConfig(); });
       node.addEventListener('input', () => { readConfigFromUi(); saveConfig(); });
     }
-    for (const node of [n.initReaderBeforeProbe, ...n.patternPresetChecks].filter(Boolean)) node.addEventListener('change', () => { readConfigFromUi(); saveConfig(); });
+    for (const node of [n.initReaderBeforeProbe, n.includeCover, n.includeMetadata, n.includeIdentityPage, ...n.patternPresetChecks].filter(Boolean)) node.addEventListener('change', () => { readConfigFromUi(); saveConfig(); renderCourseMetadata(); });
     if (n.speedModeRadios) for (const node of n.speedModeRadios) node.addEventListener('change', () => { readConfigFromUi(); saveConfig(); });
     for (const node of [...n.outputFormatRadios, ...n.outputBundleRadios, ...n.pdfSearchableRadios]) node.addEventListener('change', () => { updateSaveModeUi(); readConfigFromUi(); saveConfig(); });
     updateSaveModeUi();
 
     renderResults();
     renderLogs();
-    renderLinkTests();
     updateButtons();
   }
 
@@ -2628,6 +3073,7 @@
       #${UI_ID} .nss-summary strong{display:block;font-size:21px;color:#fff;line-height:1.1} #${UI_ID} .nss-summary span{display:block;color:var(--nemo-soft);font-size:11px;margin-top:2px}
       #${UI_ID} details.nss-advanced summary,#${UI_ID} .nss-logbox summary{cursor:pointer;list-style:none;display:flex;justify-content:space-between;align-items:center;font-weight:900;color:#dbeafe} #${UI_ID} details.nss-advanced summary::-webkit-details-marker,#${UI_ID} .nss-logbox summary::-webkit-details-marker{display:none} #${UI_ID} details.nss-advanced summary:after,#${UI_ID} .nss-logbox summary:after{content:'+';color:var(--nemo-accent);font-weight:900} #${UI_ID} details[open].nss-advanced summary:after,#${UI_ID} .nss-logbox[open] summary:after{content:'–'} #${UI_ID} details.nss-advanced summary em{font-style:normal;color:var(--nemo-soft);font-size:11px;font-weight:800}
       #${UI_ID} .nss-checks{display:grid;grid-template-columns:1fr;gap:8px;margin:10px 0} #${UI_ID} .nss-checks label{display:flex;align-items:center;gap:8px;margin:0;padding:8px 10px;border:1px solid rgba(148,163,184,.20);border-radius:12px;background:rgba(2,6,23,.36);font-weight:800;color:#dbeafe} #${UI_ID} .nss-checks input{width:auto;accent-color:#22d3ee}
+      #${UI_ID} .nss-metadata-checks{grid-template-columns:1fr} #${UI_ID} .nss-meta-summary{white-space:pre-wrap;margin:8px 0 10px;color:#dbeafe;font:12px/1.45 system-ui,-apple-system,Segoe UI,sans-serif;background:rgba(2,6,23,.38);border:1px solid rgba(148,163,184,.18);border-radius:12px;padding:10px} #${UI_ID} .nss-metadata-json summary{cursor:pointer;color:#67e8f9;font-weight:900;margin-top:8px} #${UI_ID} .nss-metadata-json textarea{margin-top:8px;min-height:90px}
       #${UI_ID} .nss-pattern-presets{display:grid;grid-template-columns:1fr;gap:7px;margin:6px 0 10px} #${UI_ID} .nss-preset{display:flex;align-items:flex-start;gap:9px;margin:0;padding:9px 10px;border:1px solid rgba(148,163,184,.20);border-radius:12px;background:rgba(2,6,23,.32);cursor:pointer} #${UI_ID} .nss-preset:hover{border-color:rgba(34,211,238,.45);background:rgba(14,116,144,.12)} #${UI_ID} .nss-preset input{width:auto;margin-top:3px;accent-color:#22d3ee} #${UI_ID} .nss-preset span{display:block} #${UI_ID} .nss-preset b{display:block;color:#e0f2fe;font-size:12px} #${UI_ID} .nss-preset small{display:block;color:var(--nemo-soft);font-size:11px;margin-top:1px}
       #${UI_ID} .nss-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:9px}
       #${UI_ID} .nss-linktests{display:grid;gap:6px;margin:8px 0 10px} #${UI_ID} .nss-linktest{border:1px solid rgba(148,163,184,.20);border-radius:12px;padding:8px 10px;background:rgba(2,6,23,.36)} #${UI_ID} .nss-linktest strong{display:block;font-size:12px;color:#fff} #${UI_ID} .nss-linktest span{display:block;color:var(--nemo-soft);font-size:11px;margin-top:2px} #${UI_ID} .nss-linktest.ok{border-color:rgba(34,197,94,.42);background:rgba(20,83,45,.25)} #${UI_ID} .nss-linktest.bad{border-color:rgba(248,113,113,.42);background:rgba(127,29,29,.25)} #${UI_ID} .nss-empty-mini{color:var(--nemo-soft);font-size:12px;border:1px dashed rgba(148,163,184,.25);border-radius:12px;padding:8px 10px;background:rgba(2,6,23,.25)}
@@ -2637,6 +3083,14 @@
       #${UI_ID} .nss-pill{display:inline-block;border-radius:999px;padding:3px 8px;font-size:11px;font-weight:900;margin:0 7px 5px 0} #${UI_ID} .nss-pill.ok{background:rgba(34,197,94,.18);color:#86efac;border:1px solid rgba(34,197,94,.35)} #${UI_ID} .nss-pill.bad{background:rgba(239,68,68,.16);color:#fecaca;border:1px solid rgba(239,68,68,.35)}
       #${UI_ID} a{color:#67e8f9;font-weight:900;text-decoration:none;margin-right:8px} #${UI_ID} button.nss-mini{padding:4px 7px;border-radius:8px;font-size:11px;margin:2px 3px 2px 0;background:rgba(14,116,144,.22);border-color:rgba(34,211,238,.35);color:#a5f3fc}
       #${UI_ID} pre{white-space:pre-wrap;max-height:160px;overflow:auto;margin:8px 0 0;color:#cbd5e1;font:11px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace;background:rgba(2,6,23,.35);border-radius:12px;padding:9px;border:1px solid rgba(148,163,184,.14)}
+
+      #${UI_ID} .nss-mini-bubble{display:none;align-items:center;gap:8px;min-width:112px;max-width:min(280px,calc(100vw - 24px));padding:11px 14px;border-radius:999px;background:linear-gradient(135deg,#0891b2,#2563eb);border:1px solid rgba(34,211,238,.70);color:#fff;box-shadow:0 18px 45px rgba(0,0,0,.42);font-weight:900;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+      #${UI_ID} .nss-mini-dot{width:9px;height:9px;border-radius:999px;background:#86efac;box-shadow:0 0 0 3px rgba(134,239,172,.18);flex:0 0 auto}
+      #${UI_ID}.nss-running .nss-mini-dot{background:#fbbf24;box-shadow:0 0 0 3px rgba(251,191,36,.20);animation:nss-pulse 1.2s infinite}
+      #${UI_ID}.nss-minimized{width:auto;max-height:none;border:0;background:transparent;box-shadow:none;overflow:visible;backdrop-filter:none}
+      #${UI_ID}.nss-minimized .nss-header,#${UI_ID}.nss-minimized .nss-content{display:none}
+      #${UI_ID}.nss-minimized .nss-mini-bubble{display:flex}
+      @keyframes nss-pulse{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(.72);opacity:.65}}
       #${UI_ID}.nss-compact{width:min(392px,calc(100vw - 24px))} #${UI_ID}.nss-compact .nss-advanced,#${UI_ID}.nss-compact .nss-note,#${UI_ID}.nss-compact .nss-logbox{display:none} #${UI_ID}.nss-compact .nss-table-wrap{max-height:220px}
       @media(max-width:640px){#${UI_ID}{right:10px;bottom:10px;width:calc(100vw - 20px);max-height:calc(100vh - 20px)}#${UI_ID} .nss-grid,#${UI_ID} .nss-summary,#${UI_ID} .nss-save-actions,#${UI_ID} .nss-option-grid{grid-template-columns:1fr}}
     `;
@@ -2644,7 +3098,11 @@
   }
 
   /** Shows panel. */
-  function show() { if (!document.getElementById(UI_ID)) buildUi(); }
+  function show() {
+    const existing = document.getElementById(UI_ID);
+    if (!existing) buildUi();
+    else restoreUi();
+  }
 
   /** Hides panel. */
   function hide() { const ui = document.getElementById(UI_ID); if (ui) ui.remove(); }
@@ -2666,6 +3124,8 @@
     destroy,
     scan: runScan,
     stop: stopScan,
+    minimize: minimizeUi,
+    restore: restoreUi,
     exportJson,
     downloadOneDocument,
     downloadSelectedDocuments,
@@ -2692,7 +3152,13 @@
     buildImageUrl,
     getServiceDocVariants,
     collectDocsFromPageLinks,
-    parseReaderLink
+    parseReaderLink,
+    extractRbvMetadataFromPage,
+    resolveCourseCodes,
+    importMetadataFromPage,
+    applyMetadataSubfolder,
+    buildMetadataFiles,
+    fetchCoverBlob
   };
 
   buildUi();
