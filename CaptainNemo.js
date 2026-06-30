@@ -1,13 +1,6 @@
-// ==UserScript==
-// @name         Nemo Subfolder Studio - Downloader
-// @namespace    https://pustaka.ut.ac.id/nemo
-// @version      1.3.3
-// @description  Memeriksa isi satu subfolder UT, mengunduh PNG/ZIP, membuat PDF searchable, TXT, dan Markdown.
-// @match        https://pustaka.ut.ac.id/*
-// @run-at       document-idle
-// @grant        none
-// ==/UserScript==
-
+/* Nemo Subfolder Studio Downloader v1.3.3 Simplified Patterns
+   Web-loadable bundle for bookmarklet loader.
+   Host this file on HTTPS, then point the loader bookmarklet to its public URL. */
 (() => {
   'use strict';
 
