@@ -75,10 +75,6 @@
   /** Loads saved user settings and migrates older pattern text into preset choices. */
   function loadConfig() {
     try {
-      // Try GAS bridge first if available
-      if (window.GAS_BRIDGE && typeof window.GAS_BRIDGE.loadConfig === 'function') {
-        // GAS will sync config via async call after page load
-      }
       const raw = localStorage.getItem(STORE_KEY);
       const config = raw ? { ...DEFAULTS, ...JSON.parse(raw) } : { ...DEFAULTS };
       return normalizePatternConfig(config);
@@ -89,15 +85,7 @@
 
   /** Persists current settings. */
   function saveConfig() {
-    try {
-      localStorage.setItem(STORE_KEY, JSON.stringify(state.config));
-      // Also save to GAS if available
-      if (window.GAS_BRIDGE && typeof window.GAS_BRIDGE.saveConfig === 'function') {
-        window.GAS_BRIDGE.saveConfig(state.config);
-      }
-    } catch (e) {
-      // Fail silently, continue execution
-    }
+    try { localStorage.setItem(STORE_KEY, JSON.stringify(state.config)); } catch { }
   }
 
 
