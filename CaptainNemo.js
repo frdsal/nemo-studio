@@ -1,6 +1,13 @@
 // =============================================================================
-// CaptainNemo Subfolder Studio — Nemo Capture v1.5.1
+// CaptainNemo Subfolder Studio — Nemo Capture v1.5.2
 // Changelog: 2026-07-01
+//
+// Fixed:
+// Added:
+//   - Fitur ZIP All-in-One: satu ZIP berisi PNG/PDF/TXT/MD sesuai checkbox
+//     PNG difetch sekali per dokumen, dipakai bersama untuk PNG folder + PDF variants
+//   - Format bisa dipilih: png, pdfSearchable, pdfImage, txt, md
+//   - State allInOneFormats disimpan di localStorage
 //
 // Fixed:
 //   - [RETRY] collectPngBlobsForDocument dan collectPngEntriesForDocument sekarang
@@ -48,7 +55,7 @@
 (() => {
   'use strict';
 
-  const APP_VERSION = '1.5.1';
+  const APP_VERSION = '1.5.2';
   const APP_KEY = '__nemoSubfolderStudioDownloaderV150__';
   const UI_ID = 'nemo_subfolder_studio_downloader_v150';
   const STYLE_ID = 'nemo_subfolder_studio_downloader_v150_style';
@@ -88,7 +95,8 @@
     includeMetadata: true,
     includeIdentityPage: true,
     metadata: null,
-    rbvUrl: ''
+    rbvUrl: '',
+    allInOneFormats: { png: true, pdfSearchable: true, pdfImage: false, txt: true, md: true }
   };
 
   const state = {
@@ -1621,6 +1629,10 @@
     state.config.subfolder = resolveInputSubfolder(rawSubfolderInput);
     updateSubfolderHint(rawSubfolderInput, state.config.subfolder);
     state.config.rbvUrl = normalizeRbvPageUrl(n.rbvUrl ? n.rbvUrl.value : '') || String(n.rbvUrl ? n.rbvUrl.value : '').trim();
+    if (n.allInOneChecks) {
+      if (!state.config.allInOneFormats) state.config.allInOneFormats = { ...DEFAULTS.allInOneFormats };
+      for (const input of n.allInOneChecks) state.config.allInOneFormats[input.getAttribute('data-nss-aio')] = input.checked;
+    }
     state.config.patternPresetKeys = checkedPatternPresetKeys();
     state.config.customPatterns = n.customPatterns ? n.customPatterns.value : '';
     state.config.patterns = buildEffectivePatternString(state.config);
@@ -1693,6 +1705,7 @@
     n.exportBtn.disabled = !state.results.length;
     if (n.downloadModeBtn) n.downloadModeBtn.disabled = state.running || !sel.length;
     n.clearBtn.disabled = state.running || !state.results.length;
+    if (n.allInOneBtn) n.allInOneBtn.disabled = state.running || !sel.length;
     if (state.ui) state.ui.classList.toggle('nss-running', Boolean(state.running));
     updateMiniBubble();
   }
@@ -3194,6 +3207,138 @@
   }
 
   /** Runs the selected download mode. */
+  /** Downloads one all-in-one ZIP with all selected format variants.
+   *  PNG blobs and native text are each fetched once per document and shared
+   *  across all requested format variants to minimise server requests. */
+  async function downloadAllInOneZip(items) {
+    if (state.running) return;
+    if (!items.length) return alert('Pilih minimal satu dokumen valid.');
+    const fmts = state.config.allInOneFormats || { ...DEFAULTS.allInOneFormats };
+    if (!fmts.png && !fmts.pdfSearchable && !fmts.pdfImage && !fmts.txt && !fmts.md) {
+      return alert('Pilih minimal satu format di bagian ZIP All-in-One.');
+    }
+    if (!confirmLargeDownload(items)) return;
+
+    const needsPng  = fmts.png || fmts.pdfSearchable || fmts.pdfImage;
+    const needsText = fmts.txt || fmts.md || fmts.pdfSearchable;
+
+    state.running = true;
+    state.stopRequested = false;
+    state.controller = new AbortController();
+    updateButtons();
+
+    const safeBase  = safeName(normalizeSubfolder(state.config.subfolder).replace(/[/]+$/, ''), 'subfolder');
+    const zipPrefix = `${safeBase}-all-in-one/`;
+    const allEntries          = [];
+    const txtParts            = [];
+    const mdParts             = [];
+    const pdfSearchableRecords = [];
+    const pdfImageRecords      = [];
+
+    try {
+      if (state.config.includeMetadata) {
+        const metaFiles = await buildMetadataFiles(`${zipPrefix}00_Metadata/`);
+        allEntries.push(...metaFiles);
+      }
+
+      for (let i = 0; i < items.length; i += 1) {
+        if (state.stopRequested) throw new Error('Proses dihentikan.');
+        const result = items[i];
+        const folderName = documentFolderName(result);
+        log(`All-in-One: memproses ${result.label} (${i + 1}/${items.length})`);
+        setStatus(`All-in-One: mengambil ${result.label} (${i + 1}/${items.length})`);
+
+        // Fetch PNG blobs once — dipakai untuk folder PNG + kedua varian PDF
+        let pngBundle = null;
+        if (needsPng) {
+          pngBundle = await collectPngBlobsForDocument(result, i, items.length);
+          if (!pngBundle.items.length) {
+            log(`${result.doc}: tidak ada gambar berhasil, dilewati.`);
+            continue;
+          }
+        }
+
+        // Fetch native text once — dipakai untuk PDF searchable + TXT + MD
+        let nativeBundle = { pages: [], offsetInfo: null };
+        if (needsText) {
+          nativeBundle = await collectNativeTextForDocument(result);
+        }
+
+        // PNG subfolder entries
+        if (fmts.png && pngBundle) {
+          for (const item of pngBundle.items) {
+            allEntries.push({
+              name: `${zipPrefix}png/${folderName}/page-${String(item.page).padStart(3, '0')}.png`,
+              blob: item.blob
+            });
+          }
+        }
+
+        // Accumulate PDF page records
+        if (fmts.pdfSearchable && pngBundle) {
+          pdfSearchableRecords.push(...makePdfPageRecords(pngBundle.items, nativeBundle));
+        }
+        if (fmts.pdfImage && pngBundle) {
+          pdfImageRecords.push(...makePdfPageRecords(pngBundle.items, { pages: [], offsetInfo: null }));
+        }
+
+        // Accumulate text parts
+        if (fmts.txt) txtParts.push(buildPlainText(result, nativeBundle));
+        if (fmts.md)  mdParts.push(buildMarkdown(result, nativeBundle));
+
+        await sleep(Number(state.config.delayMs) || DEFAULTS.delayMs);
+      }
+
+      // Build combined PDFs dari accumulated records
+      if (fmts.pdfSearchable && pdfSearchableRecords.length) {
+        setStatus('Membuat PDF searchable gabungan...');
+        const pdf = await createPdfFromPageRecords(pdfSearchableRecords, { searchable: true });
+        allEntries.push({ name: `${zipPrefix}${safeBase}-searchable.pdf`, blob: pdf });
+        log('PDF searchable gabungan selesai.');
+      }
+      if (fmts.pdfImage && pdfImageRecords.length) {
+        setStatus('Membuat PDF gambar gabungan...');
+        const pdf = await createPdfFromPageRecords(pdfImageRecords, { searchable: false });
+        allEntries.push({ name: `${zipPrefix}${safeBase}-gambar-saja.pdf`, blob: pdf });
+        log('PDF gambar gabungan selesai.');
+      }
+
+      // Build text files
+      if (fmts.txt && txtParts.length) {
+        const divider  = '\n\n' + '='.repeat(60) + '\n\n';
+        const combined = txtParts.join(divider);
+        allEntries.push({ name: `${zipPrefix}${safeBase}.txt`, blob: new Blob([combined], { type: 'text/plain' }) });
+      }
+      if (fmts.md && mdParts.length) {
+        const combined = mdParts.join('\n\n---\n\n');
+        allEntries.push({ name: `${zipPrefix}${safeBase}.md`, blob: new Blob([combined], { type: 'text/markdown' }) });
+      }
+
+      if (!allEntries.length) throw new Error('Tidak ada entry yang berhasil dibuat.');
+
+      setStatus('Membuat ZIP All-in-One...');
+      const zip = await createZip(allEntries);
+      downloadBlob(zip, `${safeBase}-all-in-one.zip`);
+
+      const fmtList = [
+        fmts.png && 'PNG', fmts.pdfSearchable && 'PDF teks',
+        fmts.pdfImage && 'PDF gambar', fmts.txt && 'TXT', fmts.md && 'MD'
+      ].filter(Boolean).join(', ');
+      setStatus(`ZIP All-in-One selesai. ${items.length} dok, format: ${fmtList}.`);
+      log(`ZIP All-in-One selesai. Format: ${fmtList}.`);
+
+    } catch (error) {
+      setStatus(`ZIP All-in-One gagal: ${String(error && error.message || error)}`, true);
+      log(`ZIP All-in-One gagal: ${String(error && error.message || error)}`);
+    } finally {
+      state.running = false;
+      state.stopRequested = false;
+      state.controller = null;
+      resetProgress();
+      updateButtons();
+    }
+  }
+
   async function runSelectedDownloadMode() {
     readConfigFromUi();
     saveConfig();
@@ -3469,6 +3614,21 @@
               </table>
             </div>
 
+            <details class="nss-card nss-details">
+              <summary class="nss-details-summary"><span>ZIP All-in-One</span></summary>
+              <div class="nss-checks">
+                <label><input type="checkbox" data-nss-aio="png"> PNG (subfolder per dokumen)</label>
+                <label><input type="checkbox" data-nss-aio="pdfSearchable"> PDF &mdash; teks bisa dicari</label>
+                <label><input type="checkbox" data-nss-aio="pdfImage"> PDF &mdash; gambar saja</label>
+                <label><input type="checkbox" data-nss-aio="txt"> TXT gabungan</label>
+                <label><input type="checkbox" data-nss-aio="md"> MD gabungan</label>
+              </div>
+              <p class="nss-note" style="margin-top:8px">PNG difetch sekali meski PDF juga dicentang. Proses lebih lama untuk mata kuliah besar.</p>
+              <div style="margin-top:10px">
+                <button type="button" class="primary" data-nss="allInOneBtn">Unduh ZIP All-in-One</button>
+              </div>
+            </details>
+
           </div>
           <div class="nss-panel-footer">
             <button type="button" class="primary" data-nss="downloadMode">Unduh Terpilih</button>
@@ -3538,7 +3698,9 @@
       },
       progressWrap: ui.querySelector('[data-nss="progressWrap"]'),
       progressDoc: ui.querySelector('[data-nss="progressDoc"]'),
-      progressPage: ui.querySelector('[data-nss="progressPage"]')
+      progressPage: ui.querySelector('[data-nss="progressPage"]'),
+      allInOneBtn: ui.querySelector('[data-nss="allInOneBtn"]'),
+      allInOneChecks: Array.from(ui.querySelectorAll('[data-nss-aio]'))
     };
 
     const n = state.nodes;
@@ -3564,6 +3726,10 @@
     if (n.includeIdentityPage) n.includeIdentityPage.checked = state.config.includeIdentityPage !== false;
     renderCourseMetadata();
     updateSubfolderHint(n.subfolder.value, state.config.subfolder);
+    if (n.allInOneChecks) {
+      const aio = state.config.allInOneFormats || DEFAULTS.allInOneFormats;
+      for (const input of n.allInOneChecks) input.checked = Boolean(aio[input.getAttribute('data-nss-aio')]);
+    }
 
     for (const btn of n.tabBtns) btn.addEventListener('click', () => switchTab(btn.getAttribute('data-nss-tab')));
     switchTab(state.activeTab || 'setup');
@@ -3581,6 +3747,11 @@
     ui.querySelector('[data-nss="hide"]').addEventListener('click', () => ui.remove());
     if (n.minimizeBtn) n.minimizeBtn.addEventListener('click', minimizeUi);
     if (n.restoreBtn) n.restoreBtn.addEventListener('click', restoreUi);
+
+    if (n.allInOneBtn) n.allInOneBtn.addEventListener('click', () => downloadAllInOneZip(selectedResults()));
+    if (n.allInOneChecks) for (const input of n.allInOneChecks) {
+      input.addEventListener('change', () => { readConfigFromUi(); saveConfig(); });
+    }
 
     if (n.selectAll) n.selectAll.addEventListener('change', e => {
       state.results.filter(r => r.valid).forEach(r => r.selected = e.target.checked);
