@@ -1,5 +1,5 @@
 // =============================================================================
-// CaptainNemo Subfolder Studio — Nemo Capture v1.5.6
+// CaptainNemo Subfolder Studio — Nemo Capture v1.5.7
 // Changelog: 2026-07-01
 //
 // Fixed:
@@ -55,7 +55,7 @@
 (() => {
   'use strict';
 
-  const APP_VERSION = '1.5.6';
+  const APP_VERSION = '1.5.7';
   const APP_KEY = '__nemoSubfolderStudioDownloaderV150__';
   const UI_ID = 'nemo_subfolder_studio_downloader_v150';
   const STYLE_ID = 'nemo_subfolder_studio_downloader_v150_style';
@@ -1805,18 +1805,29 @@
 
   /** Probes one PNG request to detect whether the user is logged in to Pustaka UT.
    *  Result is cached in state.loginStatus for the duration of the session. */
+  /** Probes login status via GET view.php?format=json and inspects response body text.
+   *  Server has two layers: session cookie + FlowPaper token.
+   *  HEAD probe is unreliable because a valid-but-tokenless session also returns 200.
+   *  Body text is the only reliable differentiator:
+   *    "Error:Incorrect file specified" => session invalid => not logged in
+   *    "Don't waste your time"          => session valid, no token => can still scan (Nemo handles init)
+   *    JSON data                         => fully active
+   */
   async function checkLoginStatus() {
     if (state.loginStatus === 'ok') return;
     try {
-      // view.php?format=png HEAD: 200 = logged in, 403 = not logged in
-      // Subfolder tidak perlu valid, server cek sesi dulu sebelum cek konten
+      const subfolder = normalizeSubfolder(state.config.subfolder || 'EKMA4101/');
       const probeUrl = new URL(VIEW_PATH, location.origin);
       probeUrl.searchParams.set('doc', 'DAFIS');
-      probeUrl.searchParams.set('format', 'png');
-      probeUrl.searchParams.set('subfolder', 'EKMA4101/');
+      probeUrl.searchParams.set('format', 'json');
+      probeUrl.searchParams.set('subfolder', subfolder);
       probeUrl.searchParams.set('page', '1');
-      const res = await fetch(probeUrl.href, { credentials: 'include', method: 'HEAD' });
-      state.loginStatus = res.status === 403 ? 'logged-out' : 'ok';
+      const res = await fetch(probeUrl.href, { credentials: 'include' });
+      const body = await res.text();
+      // "Error:Incorrect file" = session invalid = belum login
+      // "Don't waste" = session valid tapi tanpa FlowPaper token = bisa scan
+      // JSON = fully active
+      state.loginStatus = body.includes('Incorrect file') ? 'logged-out' : 'ok';
     } catch {
       state.loginStatus = 'logged-out';
     }
