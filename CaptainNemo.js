@@ -1,5 +1,5 @@
 // =============================================================================
-// CaptainNemo Subfolder Studio — Nemo Capture v1.5.9
+// CaptainNemo Subfolder Studio — Nemo Capture v1.5.10
 // Changelog: 2026-07-01
 //
 // Fixed:
@@ -55,7 +55,7 @@
 (() => {
   'use strict';
 
-  const APP_VERSION = '1.5.9';
+  const APP_VERSION = '1.5.10';
   const APP_KEY = '__nemoSubfolderStudioDownloaderV150__';
   const UI_ID = 'nemo_subfolder_studio_downloader_v150';
   const STYLE_ID = 'nemo_subfolder_studio_downloader_v150_style';
@@ -3492,6 +3492,7 @@
   /** Builds the full tab-based UI. */
   function buildUi() {
     state.config = loadConfig();
+    state.loginStatus = 'unknown';
     injectStyle();
     const old = document.getElementById(UI_ID);
     if (old) old.remove();
@@ -3808,7 +3809,7 @@
     if (n.applyMetadataSubfolderBtn) n.applyMetadataSubfolderBtn.addEventListener('click', applyMetadataSubfolder);
     if (n.clearMetadataBtn) n.clearMetadataBtn.addEventListener('click', () => setCourseMetadata(null, 'hapus'));
     if (n.importMetadataJsonBtn) n.importMetadataJsonBtn.addEventListener('click', importMetadataJson);
-    ui.querySelector('[data-nss="hide"]').addEventListener('click', () => { localStorage.removeItem(STORE_KEY); ui.remove(); });
+    ui.querySelector('[data-nss="hide"]').addEventListener('click', () => { localStorage.removeItem(STORE_KEY); state.loginStatus = 'unknown'; ui.remove(); });
     if (n.minimizeBtn) n.minimizeBtn.addEventListener('click', minimizeUi);
     if (n.restoreBtn) n.restoreBtn.addEventListener('click', restoreUi);
 
