@@ -1,10 +1,52 @@
+// =============================================================================
+// CaptainNemo Subfolder Studio — Nemo Capture v1.5.0
+// Changelog: 2025-07-01
+//
+// Added:
+//   - Tab-based navigation: Setup | Hasil | Log
+//   - Dual-layer progress bar (doc progress + page progress)
+//   - Inline subfolder resolution hint below input (LOGIC-2)
+//   - Select-all checkbox in results table header
+//   - Per-row action menu via <details> popover (ZIP PNG, PDF, TXT, MD, Buka Reader)
+//   - switchTab(), updateProgress(), resetProgress(), updateSubfolderHint() functions
+//   - Panel width: 430px → 560px
+//   - Font: 12px → 13px, spacing 8px grid, redesigned dark theme
+//
+// Changed:
+//   - APP_VERSION '1.4.7' → '1.5.0'
+//   - APP_KEY / UI_ID / STYLE_ID: v147 → v150
+//   - STORE_KEY unchanged (config persistence across upgrade)
+//   - renderResults: 7 columns → 5 columns, removed inline action buttons
+//   - updateButtons: caches selectedResults() once per call (PERF-1)
+//   - readConfigFromUi: shows hint instead of silent subfolder rewrite (LOGIC-2)
+//   - isNoiseToken: threshold 120 → 300 chars (NOISE-1)
+//   - buildMetadataReadme: edition field only emitted when explicitly set (BUILD-1)
+//   - exportJson: filename uses safeName() consistently (FNAME-1)
+//   - normalizePatternConfig: removes legacy 'compact' key from loaded config
+//
+// Fixed:
+//   - [BKM-1/BKM-2] Script version bump to V150 matches new bookmarklet
+//   - [UI-1] Panel header now shows APP_VERSION dynamically
+//   - [UI-2] Empty state says 'Cek' consistent with button label
+//   - [PERF-1] updateButtons() no longer calls selectedResults() 5x per invocation
+//   - [LOGIC-1] downloadTextForSelectedDocuments / downloadCombined now confirm large downloads
+//   - [LOGIC-3] Removed double sleep in downloadCombinedTextForSelectedDocuments
+//   - [TRACK-1] pdfStats now populated in all 3 PDF download flows
+//   - [DEAD-1] pageBlobCache removed from state (was never populated)
+//   - [DEAD-2] Null node references (usePatterns, usePageLinks, etc.) removed from buildUi
+//   - [NOISE-1] Token length threshold raised 120→300 to preserve long course headers
+//   - [BUILD-1] README no longer emits "Edisi: Edisi 1" for undated documents
+//   - [FNAME-1] exportJson filename sanitized via safeName() consistently
+//   - [compact-dead] Removed dead state.config.compact save from readConfigFromUi
+//
+// =============================================================================
 (() => {
   'use strict';
 
-  const APP_VERSION = '1.4.7';
-  const APP_KEY = '__nemoSubfolderStudioDownloaderV147__';
-  const UI_ID = 'nemo_subfolder_studio_downloader_v147';
-  const STYLE_ID = 'nemo_subfolder_studio_downloader_v147_style';
+  const APP_VERSION = '1.5.0';
+  const APP_KEY = '__nemoSubfolderStudioDownloaderV150__';
+  const UI_ID = 'nemo_subfolder_studio_downloader_v150';
+  const STYLE_ID = 'nemo_subfolder_studio_downloader_v150_style';
   const STORE_KEY = 'nemo.subfolderStudio.downloader.v147';
   const VIEW_PATH = '/reader/services/view.php';
   const READER_PATH = '/reader/index.php';
@@ -61,7 +103,8 @@
     nativeTextCache: new Map(),
     pdfStats: null,
     pageMetaCache: new Map(),
-    pageBlobCache: new Map(),
+    activeTab: 'setup',
+    progress: { docIndex: 0, docTotal: 0, pageIndex: 0, pageTotal: 0 },
     courseMetadata: null,
     resolvedCourse: null,
     coverBlobCache: new Map()
@@ -99,6 +142,7 @@
     }
     if (!keys.length) keys = DEFAULT_PATTERN_PRESET_KEYS.slice();
     const normalized = { ...config, patternPresetKeys: keys };
+    delete normalized.compact;
     normalized.patterns = buildEffectivePatternString(normalized);
     return normalized;
   }
@@ -660,7 +704,7 @@
       `# ${r.courseCode || ''}${title ? ' - ' + title : ''}`.trim(),
       '',
       authors ? `Penulis: ${authors}` : '',
-      rec.edition || m.edition || r.editionNumber ? `Edisi: ${rec.edition || m.edition || ('Edisi ' + r.editionNumber)}` : '',
+      (rec.edition || m.edition) ? `Edisi: ${rec.edition || m.edition}` : (r.editionNumber && r.editionNumber > 1 ? `Edisi: Edisi ${r.editionNumber}` : ''),
       rec.sks || m.sks ? `SKS: ${rec.sks || m.sks}` : '',
       rec.moduleCount || m.modules ? `Jumlah modul: ${rec.moduleCount || m.modules}` : '',
       rec.bibliographicPages || m.bibliographicPages ? `Halaman bibliografi: ${rec.bibliographicPages || m.bibliographicPages}` : '',
@@ -1517,6 +1561,7 @@
     updateButtons();
     renderResults();
 
+    switchTab('hasil');
     log(`Mulai cek subfolder ${subfolder}.`);
     log(`${candidates.length} kandidat akan diprobe langsung${state.config.initReaderBeforeProbe ? ' dengan persiapan dokumen' : ''}.`);
     const sourceCounts = candidates.reduce((acc, item) => {
@@ -1529,6 +1574,7 @@
     try {
       for (let i = 0; i < candidates.length; i += 1) {
         if (state.stopRequested) break;
+        updateProgress(i, candidates.length, 0, 0);
         const result = await scanCandidate(candidates[i], i, candidates.length, cache);
         state.results.push(result);
         state.results.sort((a, b) => (a.order - b.order) || a.doc.localeCompare(b.doc, undefined, { numeric: true, sensitivity: 'base' }));
@@ -1549,6 +1595,7 @@
       state.running = false;
       state.stopRequested = false;
       state.controller = null;
+      resetProgress();
       updateButtons();
       renderResults();
     }
@@ -1562,10 +1609,12 @@
     setStatus('Menghentikan proses...');
   }
 
-  /** Reads UI values into config. */
+  /** Reads UI values into config and shows resolution hint (LOGIC-2). */
   function readConfigFromUi() {
     const n = state.nodes;
-    state.config.subfolder = resolveInputSubfolder(n.subfolder.value);
+    const rawSubfolderInput = n.subfolder.value;
+    state.config.subfolder = resolveInputSubfolder(rawSubfolderInput);
+    updateSubfolderHint(rawSubfolderInput, state.config.subfolder);
     state.config.rbvUrl = normalizeRbvPageUrl(n.rbvUrl ? n.rbvUrl.value : '') || String(n.rbvUrl ? n.rbvUrl.value : '').trim();
     state.config.patternPresetKeys = checkedPatternPresetKeys();
     state.config.customPatterns = n.customPatterns ? n.customPatterns.value : '';
@@ -1585,7 +1634,6 @@
     state.config.includeCover = n.includeCover ? Boolean(n.includeCover.checked) : true;
     state.config.includeMetadata = n.includeMetadata ? Boolean(n.includeMetadata.checked) : true;
     state.config.includeIdentityPage = n.includeIdentityPage ? Boolean(n.includeIdentityPage.checked) : true;
-    state.config.compact = state.ui.classList.contains('nss-compact');
     state.config.minimized = state.ui.classList.contains('nss-minimized');
   }
 
@@ -1630,18 +1678,15 @@
     updateMiniBubble();
   }
 
-  /** Updates main buttons. */
+  /** Updates main buttons. Caches selectedResults() once (PERF-1). */
   function updateButtons() {
     const n = state.nodes;
     if (!n.scanBtn) return;
+    const sel = selectedResults();
     n.scanBtn.disabled = state.running;
     n.stopBtn.disabled = !state.running;
     n.exportBtn.disabled = !state.results.length;
-    if (n.downloadModeBtn) n.downloadModeBtn.disabled = state.running || !selectedResults().length;
-    if (n.zipSelectedBtn) n.zipSelectedBtn.disabled = state.running || !selectedResults().length;
-    if (n.pdfSelectedBtn) n.pdfSelectedBtn.disabled = state.running || !selectedResults().length;
-    if (n.txtSelectedBtn) n.txtSelectedBtn.disabled = state.running || !selectedResults().length;
-    if (n.mdSelectedBtn) n.mdSelectedBtn.disabled = state.running || !selectedResults().length;
+    if (n.downloadModeBtn) n.downloadModeBtn.disabled = state.running || !sel.length;
     n.clearBtn.disabled = state.running || !state.results.length;
     if (state.ui) state.ui.classList.toggle('nss-running', Boolean(state.running));
     updateMiniBubble();
@@ -1657,7 +1702,7 @@
       .replace(/'/g, '&#39;');
   }
 
-  /** Renders result table. */
+  /** Renders result table: 5-column layout with details action menu. */
   function renderResults() {
     const body = state.nodes.resultBody;
     const summary = state.nodes.summary;
@@ -1670,65 +1715,63 @@
       <div><strong>${pages}</strong><span>halaman</span></div>
       <div><strong>${invalid.length}</strong><span>tidak cocok</span></div>
     `;
-
+    if (state.nodes.selectAll) {
+      const allSel = valid.length > 0 && valid.every(r => r.selected);
+      state.nodes.selectAll.checked = allSel;
+      state.nodes.selectAll.indeterminate = !allSel && valid.some(r => r.selected);
+    }
     if (!state.results.length) {
-      body.innerHTML = `<tr><td colspan="7" class="nss-empty">Belum ada hasil. Isi subfolder lalu klik Cek Subfolder.</td></tr>`;
+      body.innerHTML = `<tr><td colspan="5" class="nss-empty">Belum ada hasil. Klik Cek di tab Setup.</td></tr>`;
       updateButtons();
       return;
     }
-
     body.innerHTML = state.results.map((r, idx) => {
-      const status = r.valid ? 'Tersedia' : 'Tidak ditemukan';
-      const dim = r.width && r.height ? `${r.width}×${r.height}` : '-';
-      const open = r.valid ? `<a href="${escapeHtml(r.readerUrl)}" target="_blank" rel="noopener">Buka</a>` : '';
-      const zipBtn = r.valid ? `<button type="button" class="nss-mini" data-nss-zip-one="${idx}">ZIP PNG</button><button type="button" class="nss-mini" data-nss-pdf-one="${idx}">PDF</button><button type="button" class="nss-mini" data-nss-txt-one="${idx}">TXT</button><button type="button" class="nss-mini" data-nss-md-one="${idx}">MD</button>` : '';
-      const sources = (r.candidateSources || []).join(', ') || '-';
-      return `
-        <tr class="${r.valid ? 'is-valid' : 'is-muted'}">
-          <td>${r.valid ? `<input type="checkbox" data-nss-select="${idx}" ${r.selected ? 'checked' : ''}>` : ''}</td>
-          <td><strong>${escapeHtml(r.label)}</strong><small>${escapeHtml(r.doc)}</small></td>
-          <td>${escapeHtml(r.group)}</td>
-          <td>${r.valid ? escapeHtml(r.pages) : '-'}</td>
-          <td>${escapeHtml(dim)}</td>
-          <td><small>${escapeHtml(sources)}</small></td>
-          <td><span class="nss-pill ${r.valid ? 'ok' : 'bad'}">${escapeHtml(status)}</span>${open}${zipBtn}<small>${escapeHtml(r.note || '')}</small></td>
-        </tr>
-      `;
+      if (!r.valid) {
+        return `<tr class="is-muted"><td></td><td><strong>${escapeHtml(r.label)}</strong><small>${escapeHtml(r.doc)}</small></td><td>-</td><td><span class="nss-pill bad">Tidak ada</span></td><td></td></tr>`;
+      }
+      const dim = r.width && r.height ? ` \u00b7 ${r.width}\u00d7${r.height}` : '';
+      return `<tr class="is-valid">
+        <td><input type="checkbox" data-nss-select="${idx}" ${r.selected ? 'checked' : ''}></td>
+        <td><strong>${escapeHtml(r.label)}</strong><small>${escapeHtml(r.doc)}${escapeHtml(dim)}</small></td>
+        <td>${escapeHtml(String(r.pages))}</td>
+        <td><span class="nss-pill ok">Tersedia</span></td>
+        <td>
+          <details class="nss-row-actions">
+            <summary class="nss-row-trigger" title="Aksi">\u2193</summary>
+            <div class="nss-row-menu">
+              <a href="${escapeHtml(r.readerUrl)}" target="_blank" rel="noopener">\ud83d\udd17 Buka Reader</a>
+              <button type="button" data-nss-zip-one="${idx}">ZIP PNG</button>
+              <button type="button" data-nss-pdf-one="${idx}">PDF</button>
+              <button type="button" data-nss-txt-one="${idx}">TXT</button>
+              <button type="button" data-nss-md-one="${idx}">Markdown</button>
+            </div>
+          </details>
+        </td>
+      </tr>`;
     }).join('');
-
-    body.querySelectorAll('[data-nss-zip-one]').forEach(button => {
-      button.addEventListener('click', event => {
-        const index = Number(event.currentTarget.getAttribute('data-nss-zip-one'));
-        if (state.results[index]) downloadOneDocument(state.results[index]);
-      });
+    body.querySelectorAll('[data-nss-zip-one]').forEach(btn => {
+      btn.addEventListener('click', e => { const i = Number(e.currentTarget.getAttribute('data-nss-zip-one')); if (state.results[i]) downloadOneDocument(state.results[i]); });
     });
-
-    body.querySelectorAll('[data-nss-pdf-one]').forEach(button => {
-      button.addEventListener('click', event => {
-        const index = Number(event.currentTarget.getAttribute('data-nss-pdf-one'));
-        if (state.results[index]) downloadPdfForDocument(state.results[index]);
-      });
+    body.querySelectorAll('[data-nss-pdf-one]').forEach(btn => {
+      btn.addEventListener('click', e => { const i = Number(e.currentTarget.getAttribute('data-nss-pdf-one')); if (state.results[i]) downloadPdfForDocument(state.results[i]); });
     });
-
-    body.querySelectorAll('[data-nss-txt-one]').forEach(button => {
-      button.addEventListener('click', event => {
-        const index = Number(event.currentTarget.getAttribute('data-nss-txt-one'));
-        if (state.results[index]) downloadTextForDocument(state.results[index], 'txt');
-      });
+    body.querySelectorAll('[data-nss-txt-one]').forEach(btn => {
+      btn.addEventListener('click', e => { const i = Number(e.currentTarget.getAttribute('data-nss-txt-one')); if (state.results[i]) downloadTextForDocument(state.results[i], 'txt'); });
     });
-
-    body.querySelectorAll('[data-nss-md-one]').forEach(button => {
-      button.addEventListener('click', event => {
-        const index = Number(event.currentTarget.getAttribute('data-nss-md-one'));
-        if (state.results[index]) downloadTextForDocument(state.results[index], 'md');
-      });
+    body.querySelectorAll('[data-nss-md-one]').forEach(btn => {
+      btn.addEventListener('click', e => { const i = Number(e.currentTarget.getAttribute('data-nss-md-one')); if (state.results[i]) downloadTextForDocument(state.results[i], 'md'); });
     });
-
     body.querySelectorAll('[data-nss-select]').forEach(input => {
-      input.addEventListener('change', event => {
-        const index = Number(event.currentTarget.getAttribute('data-nss-select'));
-        if (state.results[index]) state.results[index].selected = event.currentTarget.checked;
+      input.addEventListener('change', e => {
+        const i = Number(e.currentTarget.getAttribute('data-nss-select'));
+        if (state.results[i]) state.results[i].selected = e.currentTarget.checked;
         updateButtons();
+        if (state.nodes.selectAll) {
+          const v = state.results.filter(rv => rv.valid);
+          const all = v.length > 0 && v.every(rv => rv.selected);
+          state.nodes.selectAll.checked = all;
+          state.nodes.selectAll.indeterminate = !all && v.some(rv => rv.selected);
+        }
       });
     });
     updateButtons();
@@ -1739,6 +1782,54 @@
   function renderLogs() {
     if (state.nodes.logs) state.nodes.logs.textContent = state.logs.join('\n') || 'Belum ada aktivitas.';
   }
+
+  /** Switches the active tab panel and updates tab button states. */
+  function switchTab(tabId) {
+    if (!state.nodes.tabBtns || !state.nodes.panels) return;
+    state.activeTab = tabId || 'setup';
+    for (const btn of state.nodes.tabBtns) {
+      btn.classList.toggle('nss-tab-active', btn.getAttribute('data-nss-tab') === state.activeTab);
+    }
+    for (const [key, panel] of Object.entries(state.nodes.panels)) {
+      if (panel) panel.hidden = key !== state.activeTab;
+    }
+  }
+
+  /** Updates the dual-layer progress bar (doc-level + page-level). */
+  function updateProgress(docIndex, docTotal, pageIndex, pageTotal) {
+    const wrap = state.nodes && state.nodes.progressWrap;
+    const docBar = state.nodes && state.nodes.progressDoc;
+    const pageBar = state.nodes && state.nodes.progressPage;
+    if (!wrap || !docBar || !pageBar) return;
+    state.progress = { docIndex, docTotal, pageIndex, pageTotal };
+    if (docTotal > 0) {
+      wrap.hidden = false;
+      docBar.style.width = `${Math.min(100, Math.round((docIndex + 1) / docTotal * 100))}%`;
+      pageBar.style.width = pageTotal > 0 ? `${Math.min(100, Math.round(pageIndex / pageTotal * 100))}%` : '0%';
+    } else {
+      wrap.hidden = true;
+      docBar.style.width = '0%';
+      pageBar.style.width = '0%';
+    }
+  }
+
+  /** Resets and hides the progress bar. */
+  function resetProgress() { updateProgress(0, 0, 0, 0); }
+
+  /** Shows or hides the inline subfolder resolution hint (LOGIC-2 fix). */
+  function updateSubfolderHint(rawValue, resolvedValue) {
+    const node = state.nodes && state.nodes.subfolderHint;
+    if (!node) return;
+    const raw = normalizeSubfolder(String(rawValue || ''));
+    const resolved = String(resolvedValue || '');
+    if (resolved && resolved !== raw) {
+      node.textContent = `\u2192 akan dipakai: ${resolved}`;
+      node.hidden = false;
+    } else {
+      node.hidden = true;
+    }
+  }
+
 
 
   /** Converts a string into a safe file or folder name. */
@@ -1916,6 +2007,7 @@
     const items = await runConcurrent(pageNumbers, async (page) => {
       if (state.stopRequested) throw new Error('Proses dihentikan.');
       setStatus(`Mengambil ${result.label} halaman ${page}/${pages} (${totalIndex + 1}/${totalDocs}) · ${profile.label}`);
+      updateProgress(totalIndex, totalDocs, page, pages);
       const item = await fetchPagePngBlob(result, page);
       await downloadDelay();
       return item;
@@ -1990,6 +2082,7 @@
       state.running = false;
       state.stopRequested = false;
       state.controller = null;
+      resetProgress();
       updateButtons();
     }
   }
@@ -2048,6 +2141,7 @@
       state.running = false;
       state.stopRequested = false;
       state.controller = null;
+      resetProgress();
       updateButtons();
     }
   }
@@ -2208,6 +2302,7 @@
     for (let page = 1; page <= pages; page += 1) {
       if (state.stopRequested) throw new Error('Proses dihentikan.');
       setStatus(`Membaca teks ${result.label} halaman ${page}/${pages}`);
+      updateProgress(0, 1, page, pages);
       for (const offset of fallbackOffsets) {
         const anchor = page + offset;
         if (anchor < 1) continue;
@@ -2396,7 +2491,7 @@
     if (/^<[A-Za-z].*>$/.test(text)) return true;           // <FlattenTransparency:...>
     if (/^\$\$.*\$\$/.test(text)) return true;              // $$tag$$
     if (/^<!--.*-->$/.test(text)) return true;              // HTML comments
-    if (text.length > 120) return true;                     // Very long single-token = metadata
+    if (text.length > 300) return true;                     // Very long single-token = metadata
     // Single characters that land at position 0,0 are usually invisible placeholders.
     if (text.length === 1 && token.left === 0 && token.top === 0) return true;
     return false;
@@ -2803,6 +2898,7 @@
     const rawItems = await runConcurrent(pageNumbers, async (page) => {
       if (state.stopRequested) throw new Error('Proses dihentikan.');
       setStatus(`Mengambil gambar ${result.label} halaman ${page}/${pages} (${totalIndex + 1}/${totalDocs}) · ${profile.label}`);
+      updateProgress(totalIndex, totalDocs, page, pages);
       const item = await fetchPagePngBlob(result, page);
       await downloadDelay();
       return item;
@@ -2836,6 +2932,7 @@
       const safeSubfolder = safeName(normalizeSubfolder(state.config.subfolder).replace(/\/+$/g, ''), 'subfolder');
       const suffix = searchable ? '' : '-gambar-saja';
       downloadBlob(pdf, `${safeSubfolder}-${safeName(result.doc.replace(/\.pdf$/i, ''))}${suffix}.pdf`);
+      state.pdfStats = { mode: 'single', searchable, doc: result.doc, pages: images.items.length, nativeTextPages: nativeBundle.pages.length, createdAt: new Date().toISOString() };
       setStatus(`PDF ${result.label} selesai. ${images.items.length}/${result.pages} halaman.`);
       log(`PDF ${result.doc} selesai.${searchable ? ` Teks asli: ${nativeBundle.pages.length} halaman.` : ' Gambar saja.'}`);
     } catch (error) {
@@ -2845,6 +2942,7 @@
       state.running = false;
       state.stopRequested = false;
       state.controller = null;
+      resetProgress();
       updateButtons();
     }
   }
@@ -2907,6 +3005,7 @@
       const zip = await createZip(files);
       const safeSubfolder = safeName(normalizeSubfolder(state.config.subfolder).replace(/\/+$/g, ''), 'subfolder');
       downloadBlob(zip, `${safeSubfolder}-${searchable ? 'pdf-searchable' : 'pdf-gambar-saja'}-terpilih.zip`);
+      state.pdfStats = { mode: 'zip', searchable, documents: items.map(r => r.doc), createdAt: new Date().toISOString() };
       setStatus(`ZIP PDF selesai. ${items.length} dokumen diproses.`);
       log('ZIP PDF selesai.');
     } catch (error) {
@@ -2916,6 +3015,7 @@
       state.running = false;
       state.stopRequested = false;
       state.controller = null;
+      resetProgress();
       updateButtons();
     }
   }
@@ -2957,6 +3057,7 @@
       state.running = false;
       state.stopRequested = false;
       state.controller = null;
+      resetProgress();
       updateButtons();
     }
   }
@@ -2966,6 +3067,7 @@
     if (state.running) return;
     const items = selectedResults();
     if (!items.length) return alert('Pilih minimal satu dokumen valid.');
+    if (!confirmLargeDownload(items)) return;
     state.running = true;
     state.stopRequested = false;
     state.controller = new AbortController();
@@ -2994,6 +3096,7 @@
       state.running = false;
       state.stopRequested = false;
       state.controller = null;
+      resetProgress();
       updateButtons();
     }
   }
@@ -3003,6 +3106,7 @@
     if (state.running) return;
     const items = selectedResults();
     if (!items.length) return alert('Pilih minimal satu dokumen valid.');
+    if (!confirmLargeDownload(items)) return;
     state.running = true;
     state.stopRequested = false;
     state.controller = new AbortController();
@@ -3019,7 +3123,6 @@
         } else {
           parts.push(content);
         }
-        if (Number(state.config.delayMs) > 0) await sleep(Math.min(250, Number(state.config.delayMs)));
       }
       const intro = metadataTextBlock(format).trim();
       const combinedBody = format === 'md' ? parts.join('\n\n---\n\n') : parts.join('\n\n==============================\n\n');
@@ -3036,6 +3139,7 @@
       state.running = false;
       state.stopRequested = false;
       state.controller = null;
+      resetProgress();
       updateButtons();
     }
   }
@@ -3107,7 +3211,7 @@
       logs: state.logs
     };
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
-    const safeSubfolder = normalizeSubfolder(state.config.subfolder).replace(/[^a-z0-9_-]+/gi, '-').replace(/^-+|-+$/g, '') || 'subfolder';
+    const safeSubfolder = safeName(normalizeSubfolder(state.config.subfolder).replace(/[/]+$/, ''), 'subfolder');
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
@@ -3137,7 +3241,7 @@
     } catch { return ''; }
   }
 
-  /** Builds UI. */
+  /** Builds the full tab-based UI. */
   function buildUi() {
     state.config = loadConfig();
     injectStyle();
@@ -3147,138 +3251,199 @@
     const ui = document.createElement('section');
     ui.id = UI_ID;
     ui.dataset.nemoUi = 'true';
-    ui.className = [state.config.compact ? 'nss-compact' : '', state.config.minimized ? 'nss-minimized' : ''].filter(Boolean).join(' ');
+    if (state.config.minimized) ui.classList.add('nss-minimized');
+
     ui.innerHTML = `
       <header class="nss-header">
         <div class="nss-brand">
           <strong>Nemo Capture Studio</strong>
-          <span>Metadata · v1.4.0</span>
+          <span>v${APP_VERSION}</span>
         </div>
+        <nav class="nss-tabs">
+          <button class="nss-tab" data-nss-tab="setup">Setup</button>
+          <button class="nss-tab" data-nss-tab="hasil">Hasil</button>
+          <button class="nss-tab" data-nss-tab="log">Log</button>
+        </nav>
         <div class="nss-head-actions">
-          <button type="button" data-nss="minimize">Mini</button>
-          <button type="button" data-nss="compact">${state.config.compact ? 'Detail' : 'Ringkas'}</button>
-          <button type="button" data-nss="hide">Tutup</button>
+          <button type="button" data-nss="minimize" title="Minimalkan">&#8212;</button>
+          <button type="button" data-nss="hide" title="Tutup">&#10005;</button>
         </div>
       </header>
-      <div class="nss-content">
-        <div class="nss-status-card">
-          <div class="nss-status-title">Status</div>
-          <div class="nss-status" data-nss="status">Siap. Isi subfolder lalu klik Cek.</div>
-          <div class="nss-summary" data-nss="summary">
-            <div><strong>0</strong><span>dokumen</span></div>
-            <div><strong>0</strong><span>halaman</span></div>
-            <div><strong>0</strong><span>gagal</span></div>
-          </div>
-        </div>
 
-        <div class="nss-card nss-main">
-          <div class="nss-step"><b>1</b><span>Mata kuliah</span></div>
-          <label>Kode akses / subfolder</label>
-          <input data-nss="subfolder" placeholder="Contoh: EKSI441604/ atau EKMA431404/">
-          <label>Pola dokumen awal</label>
-          <div class="nss-pattern-presets nss-pattern-front">${renderPatternPresetOptions(state.config)}</div>
-          <p class="nss-note">Fokus awal: DAFIS, TINJAUAN, dan M1 sampai M12. Tambahkan pola khusus di Pengaturan pencarian bila perlu.</p>
-          <div class="nss-actions nss-primary-actions">
-            <button type="button" class="primary" data-nss="scan">Cek</button>
+      <div class="nss-progress" data-nss="progressWrap" hidden>
+        <div class="nss-progress-doc" data-nss="progressDoc"></div>
+        <div class="nss-progress-page" data-nss="progressPage"></div>
+      </div>
+
+      <button type="button" class="nss-mini-bubble" data-nss="restore" title="Buka Nemo">
+        <span class="nss-mini-dot"></span>
+        <span data-nss="miniBubbleText">Nemo</span>
+      </button>
+
+      <div class="nss-panels">
+
+        <!-- ── SETUP ───────────────────────────────────────────── -->
+        <div class="nss-panel" data-nss-panel="setup">
+          <div class="nss-panel-scroll">
+
+            <div class="nss-card">
+              <label class="nss-label">Kode akses / subfolder</label>
+              <input data-nss="subfolder" placeholder="Contoh: EKSI441604/">
+              <div class="nss-subfolder-hint" data-nss="subfolderHint" hidden></div>
+            </div>
+
+            <div class="nss-card">
+              <label class="nss-label">Pola dokumen</label>
+              <div class="nss-pattern-presets">${renderPatternPresetOptions(state.config)}</div>
+              <p class="nss-note">DAFIS, TINJAUAN, dan M1&ndash;M12 mencakup sebagian besar mata kuliah UT. Gunakan pola tambahan di Pengaturan pencarian bila perlu.</p>
+            </div>
+
+            <details class="nss-card nss-details">
+              <summary class="nss-details-summary"><span>Cover &amp; Metadata RBV</span></summary>
+              <pre class="nss-meta-summary" data-nss="metadataSummary">Belum ada metadata RBV.</pre>
+              <label class="nss-label">Tautan RBV</label>
+              <input data-nss="rbvUrl" placeholder="https://pustaka.ut.ac.id/lib/...">
+              <div class="nss-actions-row" style="margin-top:8px;flex-wrap:wrap">
+                <button type="button" data-nss="readMetadataUrl">Ambil dari tautan</button>
+                <button type="button" data-nss="readMetadata">Dari halaman aktif</button>
+                <button type="button" data-nss="applyMetadataSubfolder">Pakai kode akses</button>
+                <button type="button" data-nss="clearMetadata">Hapus</button>
+              </div>
+              <div class="nss-checks" style="margin-top:10px">
+                <label><input type="checkbox" data-nss="includeCover"> Sertakan cover di PDF dan ZIP</label>
+                <label><input type="checkbox" data-nss="includeMetadata"> Simpan metadata dan README</label>
+                <label><input type="checkbox" data-nss="includeIdentityPage"> Halaman identitas mata kuliah</label>
+              </div>
+              <details style="margin-top:8px">
+                <summary class="nss-sub-summary">Import JSON metadata</summary>
+                <textarea data-nss="metadataJson" style="margin-top:8px;min-height:72px" placeholder="Tempel JSON dari Nemo RBV Cover Metadata Analyzer."></textarea>
+                <div style="margin-top:6px"><button type="button" data-nss="importMetadataJson">Import JSON</button></div>
+              </details>
+            </details>
+
+            <details class="nss-card nss-details">
+              <summary class="nss-details-summary"><span>Pengaturan pencarian</span></summary>
+              <div class="nss-checks">
+                <label><input type="checkbox" data-nss="initReaderBeforeProbe"> Siapkan dokumen sebelum probe</label>
+              </div>
+              <label class="nss-label" style="margin-top:10px">Pola tambahan</label>
+              <textarea data-nss="customPatterns" placeholder="Contoh: M{01-12}.pdf, MODUL{1-9}.pdf, SUPLEMEN.pdf"></textarea>
+            </details>
+
+            <details class="nss-card nss-details">
+              <summary class="nss-details-summary"><span>Pengaturan lanjutan</span></summary>
+              <div class="nss-grid-3">
+                <div>
+                  <label class="nss-label">Batas halaman</label>
+                  <input type="number" data-nss="maxPage" min="1" max="2000">
+                </div>
+                <div>
+                  <label class="nss-label">Jeda (ms)</label>
+                  <input type="number" data-nss="delayMs" min="0" max="10000">
+                </div>
+                <div>
+                  <label class="nss-label">Timeout (ms)</label>
+                  <input type="number" data-nss="timeoutMs" min="3000" max="60000">
+                </div>
+              </div>
+              <label class="nss-label" style="margin-top:10px">Kecepatan</label>
+              <div class="nss-option-grid three">
+                <label class="nss-radio-card"><input type="radio" name="nss_speed_mode" value="safe" data-nss-speed-mode><span>Aman</span></label>
+                <label class="nss-radio-card"><input type="radio" name="nss_speed_mode" value="balanced" data-nss-speed-mode><span>Seimbang</span></label>
+                <label class="nss-radio-card"><input type="radio" name="nss_speed_mode" value="fast" data-nss-speed-mode><span>Cepat</span></label>
+              </div>
+            </details>
+
+          </div>
+          <div class="nss-panel-footer">
+            <button type="button" class="primary" data-nss="scan">Cek Dokumen</button>
             <button type="button" class="danger" data-nss="stop">Stop</button>
-            <button type="button" data-nss="export">JSON</button>
           </div>
         </div>
 
-        <div class="nss-card nss-metadata-card">
-          <div class="nss-step"><b>i</b><span>Cover dan metadata</span></div>
-          <pre class="nss-meta-summary" data-nss="metadataSummary">Belum ada metadata RBV.</pre>
-          <label>Tautan RBV</label>
-          <input data-nss="rbvUrl" placeholder="https://pustaka.ut.ac.id/lib/...">
-          <div class="nss-actions">
-            <button type="button" data-nss="readMetadataUrl">Ambil dari tautan</button>
-            <button type="button" data-nss="readMetadata">Ambil dari halaman aktif</button>
-            <button type="button" data-nss="applyMetadataSubfolder">Pakai kode akses</button>
-            <button type="button" data-nss="clearMetadata">Hapus metadata</button>
-          </div>
-          <div class="nss-checks nss-metadata-checks">
-            <label><input type="checkbox" data-nss="includeCover"> Sertakan cover full-page di PDF dan ZIP</label>
-            <label><input type="checkbox" data-nss="includeMetadata"> Simpan metadata dan README</label>
-            <label><input type="checkbox" data-nss="includeIdentityPage"> Halaman metadata rapi setelah cover</label>
-          </div>
-          <details class="nss-metadata-json">
-            <summary>Import JSON metadata</summary>
-            <textarea data-nss="metadataJson" placeholder="Tempel JSON dari Nemo RBV Cover Metadata Analyzer bila tidak berada di halaman RBV."></textarea>
-            <div class="nss-inline-actions"><button type="button" data-nss="importMetadataJson">Import JSON</button></div>
-          </details>
-        </div>
+        <!-- ── HASIL ───────────────────────────────────────────── -->
+        <div class="nss-panel" data-nss-panel="hasil" hidden>
+          <div class="nss-panel-scroll">
 
-        <div class="nss-card nss-save-card">
-          <div class="nss-step"><b>2</b><span>Simpan hasil</span></div>
-          <div class="nss-mode-group">
-            <div class="nss-mode-title">Format</div>
-            <div class="nss-option-grid">
-              <label class="nss-radio-card"><input type="radio" name="nss_output_format" value="png" data-nss-output-format><span>Gambar PNG</span></label>
-              <label class="nss-radio-card"><input type="radio" name="nss_output_format" value="pdf" data-nss-output-format><span>PDF</span></label>
-              <label class="nss-radio-card"><input type="radio" name="nss_output_format" value="txt" data-nss-output-format><span>TXT</span></label>
-              <label class="nss-radio-card"><input type="radio" name="nss_output_format" value="md" data-nss-output-format><span>Markdown</span></label>
+            <div class="nss-status-card">
+              <div class="nss-status" data-nss="status">Siap. Isi subfolder di Setup lalu klik Cek.</div>
+              <div class="nss-summary" data-nss="summary">
+                <div><strong>0</strong><span>dokumen</span></div>
+                <div><strong>0</strong><span>halaman</span></div>
+                <div><strong>0</strong><span>tidak cocok</span></div>
+              </div>
             </div>
-          </div>
-          <div class="nss-mode-group">
-            <div class="nss-mode-title">Bentuk file</div>
-            <div class="nss-option-grid two">
-              <label class="nss-radio-card"><input type="radio" name="nss_output_bundle" value="zip" data-nss-output-bundle><span>ZIP per dokumen</span></label>
-              <label class="nss-radio-card" data-nss="singleBundleOption"><input type="radio" name="nss_output_bundle" value="single" data-nss-output-bundle><span>1 file gabungan</span></label>
+
+            <div class="nss-card">
+              <div class="nss-mode-row">
+                <div class="nss-mode-group">
+                  <div class="nss-mode-title">Format</div>
+                  <div class="nss-option-grid four">
+                    <label class="nss-radio-card"><input type="radio" name="nss_output_format" value="png" data-nss-output-format><span>PNG</span></label>
+                    <label class="nss-radio-card"><input type="radio" name="nss_output_format" value="pdf" data-nss-output-format><span>PDF</span></label>
+                    <label class="nss-radio-card"><input type="radio" name="nss_output_format" value="txt" data-nss-output-format><span>TXT</span></label>
+                    <label class="nss-radio-card"><input type="radio" name="nss_output_format" value="md" data-nss-output-format><span>MD</span></label>
+                  </div>
+                </div>
+                <div class="nss-mode-group">
+                  <div class="nss-mode-title">Bentuk file</div>
+                  <div class="nss-option-grid two">
+                    <label class="nss-radio-card"><input type="radio" name="nss_output_bundle" value="zip" data-nss-output-bundle><span>ZIP</span></label>
+                    <label class="nss-radio-card" data-nss="singleBundleOption"><input type="radio" name="nss_output_bundle" value="single" data-nss-output-bundle><span>1 file</span></label>
+                  </div>
+                </div>
+              </div>
+              <div data-nss="pdfOptions">
+                <div class="nss-mode-title" style="margin-top:10px">Isi PDF</div>
+                <div class="nss-option-grid two">
+                  <label class="nss-radio-card"><input type="radio" name="nss_pdf_searchable" value="yes" data-nss-pdf-searchable><span>Teks bisa dicari</span></label>
+                  <label class="nss-radio-card"><input type="radio" name="nss_pdf_searchable" value="no" data-nss-pdf-searchable><span>Gambar saja</span></label>
+                </div>
+              </div>
+              <div class="nss-download-preview" data-nss="downloadPreview">Akan dibuat: PDF &middot; ZIP per dokumen &middot; teks bisa dicari</div>
             </div>
-          </div>
-          <div class="nss-mode-group nss-pdf-options" data-nss="pdfOptions">
-            <div class="nss-mode-title">Isi PDF</div>
-            <div class="nss-option-grid two">
-              <label class="nss-radio-card"><input type="radio" name="nss_pdf_searchable" value="yes" data-nss-pdf-searchable><span>Teks bisa dicari</span></label>
-              <label class="nss-radio-card"><input type="radio" name="nss_pdf_searchable" value="no" data-nss-pdf-searchable><span>Gambar saja</span></label>
+
+            <div class="nss-table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th style="width:32px"><input type="checkbox" data-nss="selectAll" title="Pilih semua"></th>
+                    <th>Dokumen</th>
+                    <th style="width:52px">Hal</th>
+                    <th style="width:88px">Status</th>
+                    <th style="width:40px"></th>
+                  </tr>
+                </thead>
+                <tbody data-nss="resultBody">
+                  <tr><td colspan="5" class="nss-empty">Belum ada hasil. Klik Cek di tab Setup.</td></tr>
+                </tbody>
+              </table>
             </div>
+
           </div>
-          <div class="nss-download-preview" data-nss="downloadPreview">Akan dibuat: PDF · ZIP per dokumen · teks bisa dicari</div>
-          <div class="nss-actions nss-save-actions">
+          <div class="nss-panel-footer">
             <button type="button" class="primary" data-nss="downloadMode">Unduh Terpilih</button>
+            <button type="button" data-nss="export">JSON</button>
             <button type="button" data-nss="clear">Kosongkan</button>
           </div>
         </div>
 
-        <details class="nss-card nss-advanced">
-          <summary><span>Pengaturan pencarian</span><em>opsional</em></summary>
-          <div class="nss-checks">
-            <label><input type="checkbox" data-nss="initReaderBeforeProbe"> Siapkan dokumen dulu</label>
+        <!-- ── LOG ────────────────────────────────────────────── -->
+        <div class="nss-panel" data-nss-panel="log" hidden>
+          <div class="nss-panel-scroll">
+            <pre class="nss-logcontent" data-nss="logs">Belum ada aktivitas.</pre>
           </div>
-          <label>Pola tambahan</label>
-          <textarea data-nss="customPatterns" placeholder="Contoh: DAFIS.pdf, TINJAUAN.pdf, M{01-12}.pdf, MODUL{1-12}.pdf"></textarea>
-          <p class="nss-note">Gunakan hanya jika mata kuliah memakai nama dokumen di luar DAFIS, TINJAUAN, dan M1-M12.</p>
-        </details>
-
-        <details class="nss-card nss-advanced">
-          <summary><span>Pengaturan</span><em>lanjutan</em></summary>
-          <div class="nss-grid">
-            <div><label>Batas halaman</label><input type="number" data-nss="maxPage" min="1" max="2000"></div>
-            <div><label>Jeda</label><input type="number" data-nss="delayMs" min="0" max="10000"></div>
-            <div><label>Timeout</label><input type="number" data-nss="timeoutMs" min="3000" max="60000"></div>
-          </div>
-          <label>Kecepatan</label>
-          <div class="nss-option-grid three nss-speed-options">
-            <label class="nss-radio-card"><input type="radio" name="nss_speed_mode" value="safe" data-nss-speed-mode><span>Aman</span></label>
-            <label class="nss-radio-card"><input type="radio" name="nss_speed_mode" value="balanced" data-nss-speed-mode><span>Seimbang</span></label>
-            <label class="nss-radio-card"><input type="radio" name="nss_speed_mode" value="fast" data-nss-speed-mode><span>Cepat</span></label>
-          </div>
-          <p class="nss-note">Seimbang memakai beberapa unduhan sekaligus. Aman lebih pelan. Cepat lebih agresif.</p>
-        </details>
-
-        <div class="nss-card nss-results-card">
-          <div class="nss-step"><b>3</b><span>Daftar dokumen</span></div>
-          <div class="nss-table-wrap"><table><thead><tr><th></th><th>Dokumen</th><th>Jenis</th><th>Halaman</th><th>Ukuran</th><th>Sumber</th><th>Aksi</th></tr></thead><tbody data-nss="resultBody"><tr><td colspan="7" class="nss-empty">Belum ada hasil. Isi subfolder lalu klik Cek.</td></tr></tbody></table></div>
         </div>
 
-        <details class="nss-logbox"><summary>Aktivitas</summary><pre data-nss="logs">Belum ada aktivitas.</pre></details>
       </div>
-      <button type="button" class="nss-mini-bubble" data-nss="restore" title="Buka Nemo"><span class="nss-mini-dot"></span><span data-nss="miniBubbleText">Nemo</span></button>
     `;
+
     document.documentElement.appendChild(ui);
     state.ui = ui;
+
     state.nodes = {
       subfolder: ui.querySelector('[data-nss="subfolder"]'),
+      subfolderHint: ui.querySelector('[data-nss="subfolderHint"]'),
       customPatterns: ui.querySelector('[data-nss="customPatterns"]'),
       metadataSummary: ui.querySelector('[data-nss="metadataSummary"]'),
       rbvUrl: ui.querySelector('[data-nss="rbvUrl"]'),
@@ -3292,9 +3457,7 @@
       metadataJson: ui.querySelector('[data-nss="metadataJson"]'),
       importMetadataJsonBtn: ui.querySelector('[data-nss="importMetadataJson"]'),
       patternPresetChecks: Array.from(ui.querySelectorAll('[data-nss-pattern-key]')),
-      usePatterns: null,
       initReaderBeforeProbe: ui.querySelector('[data-nss="initReaderBeforeProbe"]'),
-      usePageLinks: null,
       maxPage: ui.querySelector('[data-nss="maxPage"]'),
       delayMs: ui.querySelector('[data-nss="delayMs"]'),
       timeoutMs: ui.querySelector('[data-nss="timeoutMs"]'),
@@ -3302,16 +3465,13 @@
       stopBtn: ui.querySelector('[data-nss="stop"]'),
       exportBtn: ui.querySelector('[data-nss="export"]'),
       downloadModeBtn: ui.querySelector('[data-nss="downloadMode"]'),
+      selectAll: ui.querySelector('[data-nss="selectAll"]'),
       outputFormatRadios: Array.from(ui.querySelectorAll('[data-nss-output-format]')),
       outputBundleRadios: Array.from(ui.querySelectorAll('[data-nss-output-bundle]')),
       pdfSearchableRadios: Array.from(ui.querySelectorAll('[data-nss-pdf-searchable]')),
       pdfOptions: ui.querySelector('[data-nss="pdfOptions"]'),
       singleBundleOption: ui.querySelector('[data-nss="singleBundleOption"]'),
       downloadPreview: ui.querySelector('[data-nss="downloadPreview"]'),
-      zipSelectedBtn: null,
-      pdfSelectedBtn: null,
-      txtSelectedBtn: null,
-      mdSelectedBtn: null,
       speedModeRadios: Array.from(ui.querySelectorAll('[data-nss-speed-mode]')),
       clearBtn: ui.querySelector('[data-nss="clear"]'),
       status: ui.querySelector('[data-nss="status"]'),
@@ -3320,7 +3480,16 @@
       logs: ui.querySelector('[data-nss="logs"]'),
       minimizeBtn: ui.querySelector('[data-nss="minimize"]'),
       restoreBtn: ui.querySelector('[data-nss="restore"]'),
-      miniBubbleText: ui.querySelector('[data-nss="miniBubbleText"]')
+      miniBubbleText: ui.querySelector('[data-nss="miniBubbleText"]'),
+      tabBtns: Array.from(ui.querySelectorAll('[data-nss-tab]')),
+      panels: {
+        setup: ui.querySelector('[data-nss-panel="setup"]'),
+        hasil: ui.querySelector('[data-nss-panel="hasil"]'),
+        log: ui.querySelector('[data-nss-panel="log"]')
+      },
+      progressWrap: ui.querySelector('[data-nss="progressWrap"]'),
+      progressDoc: ui.querySelector('[data-nss="progressDoc"]'),
+      progressPage: ui.querySelector('[data-nss="progressPage"]')
     };
 
     const n = state.nodes;
@@ -3345,6 +3514,10 @@
     if (n.includeMetadata) n.includeMetadata.checked = state.config.includeMetadata !== false;
     if (n.includeIdentityPage) n.includeIdentityPage.checked = state.config.includeIdentityPage !== false;
     renderCourseMetadata();
+    updateSubfolderHint(n.subfolder.value, state.config.subfolder);
+
+    for (const btn of n.tabBtns) btn.addEventListener('click', () => switchTab(btn.getAttribute('data-nss-tab')));
+    switchTab(state.activeTab || 'setup');
 
     n.scanBtn.addEventListener('click', runScan);
     n.stopBtn.addEventListener('click', stopScan);
@@ -3359,78 +3532,201 @@
     ui.querySelector('[data-nss="hide"]').addEventListener('click', () => ui.remove());
     if (n.minimizeBtn) n.minimizeBtn.addEventListener('click', minimizeUi);
     if (n.restoreBtn) n.restoreBtn.addEventListener('click', restoreUi);
-    ui.querySelector('[data-nss="compact"]').addEventListener('click', event => {
-      ui.classList.toggle('nss-compact');
-      event.currentTarget.textContent = ui.classList.contains('nss-compact') ? 'Detail' : 'Ringkas';
-      readConfigFromUi();
-      saveConfig();
+
+    if (n.selectAll) n.selectAll.addEventListener('change', e => {
+      state.results.filter(r => r.valid).forEach(r => r.selected = e.target.checked);
+      renderResults();
+      updateButtons();
     });
 
     for (const node of [n.subfolder, n.rbvUrl, n.customPatterns, n.maxPage, n.delayMs, n.timeoutMs].filter(Boolean)) {
       node.addEventListener('change', () => { readConfigFromUi(); saveConfig(); });
       node.addEventListener('input', () => { readConfigFromUi(); saveConfig(); });
     }
-    for (const node of [n.initReaderBeforeProbe, n.includeCover, n.includeMetadata, n.includeIdentityPage, ...n.patternPresetChecks].filter(Boolean)) node.addEventListener('change', () => { readConfigFromUi(); saveConfig(); renderCourseMetadata(); });
+    for (const node of [n.initReaderBeforeProbe, n.includeCover, n.includeMetadata, n.includeIdentityPage, ...n.patternPresetChecks].filter(Boolean)) {
+      node.addEventListener('change', () => { readConfigFromUi(); saveConfig(); renderCourseMetadata(); });
+    }
     if (n.speedModeRadios) for (const node of n.speedModeRadios) node.addEventListener('change', () => { readConfigFromUi(); saveConfig(); });
-    for (const node of [...n.outputFormatRadios, ...n.outputBundleRadios, ...n.pdfSearchableRadios]) node.addEventListener('change', () => { updateSaveModeUi(); readConfigFromUi(); saveConfig(); });
-    updateSaveModeUi();
+    for (const node of [...n.outputFormatRadios, ...n.outputBundleRadios, ...n.pdfSearchableRadios]) {
+      node.addEventListener('change', () => { updateSaveModeUi(); readConfigFromUi(); saveConfig(); });
+    }
 
+    updateSaveModeUi();
     renderResults();
     renderLogs();
     updateButtons();
   }
 
-  /** Injects CSS. */
+
+  /** Injects CSS — v1.5.0 redesign: 560px, 13px base, 8px grid, tab nav, dual progress bar. */
   function injectStyle() {
     if (document.getElementById(STYLE_ID)) return;
     const style = document.createElement('style');
     style.id = STYLE_ID;
     style.textContent = `
-      #${UI_ID}{--nemo-bg:#0b1220;--nemo-panel:#111827;--nemo-card:#172033;--nemo-line:#2f3b52;--nemo-text:#eef2ff;--nemo-soft:#9aa8bd;--nemo-accent:#22d3ee;--nemo-blue:#2563eb;--nemo-good:#22c55e;--nemo-warn:#f59e0b;--nemo-bad:#ef4444;position:fixed;right:18px;bottom:18px;z-index:2147483647;width:min(430px,calc(100vw - 24px));max-height:min(760px,calc(100vh - 24px));display:flex;flex-direction:column;background:linear-gradient(180deg,rgba(15,23,42,.98),rgba(2,6,23,.98));color:var(--nemo-text);border:1px solid rgba(148,163,184,.28);border-radius:18px;box-shadow:0 22px 70px rgba(0,0,0,.48);font:12px/1.45 system-ui,-apple-system,Segoe UI,sans-serif;overflow:hidden;backdrop-filter:blur(10px)}
-      #${UI_ID} *{box-sizing:border-box} #${UI_ID} button,#${UI_ID} input,#${UI_ID} textarea{font:inherit}
-      #${UI_ID} .nss-header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 15px;background:linear-gradient(135deg,rgba(34,211,238,.16),rgba(37,99,235,.12));border-bottom:1px solid rgba(148,163,184,.20)}
-      #${UI_ID} .nss-brand strong{display:block;font-size:15px;letter-spacing:.01em;color:#fff} #${UI_ID} .nss-brand span{display:block;margin-top:2px;color:var(--nemo-soft);font-size:11px}
-      #${UI_ID} .nss-head-actions{display:flex;gap:7px} #${UI_ID} button{border:1px solid rgba(148,163,184,.30);background:rgba(15,23,42,.72);color:var(--nemo-text);border-radius:11px;padding:8px 10px;font-weight:800;cursor:pointer;transition:.15s ease;box-shadow:0 1px 0 rgba(255,255,255,.04) inset}
-      #${UI_ID} button:hover:not(:disabled){border-color:rgba(34,211,238,.72);background:rgba(30,41,59,.92);transform:translateY(-1px)} #${UI_ID} button:disabled{opacity:.42;cursor:not-allowed;transform:none}
-      #${UI_ID} button.primary{background:linear-gradient(135deg,#0891b2,#2563eb);color:#fff;border-color:rgba(34,211,238,.82);padding-inline:14px} #${UI_ID} button.danger{background:rgba(127,29,29,.44);border-color:rgba(248,113,113,.40);color:#fecaca}
-      #${UI_ID} .nss-header button{padding:6px 9px;border-radius:999px;background:rgba(15,23,42,.46)}
-      #${UI_ID} .nss-content{padding:12px;overflow:auto;max-height:calc(min(760px,calc(100vh - 24px)) - 55px);background:rgba(2,6,23,.40)}
-      #${UI_ID} .nss-card,#${UI_ID} .nss-status-card,#${UI_ID} .nss-logbox{background:rgba(23,32,51,.92);border:1px solid rgba(148,163,184,.22);border-radius:16px;padding:12px;margin-bottom:10px;box-shadow:0 1px 0 rgba(255,255,255,.04) inset}
-      #${UI_ID} .nss-step{display:flex;align-items:center;gap:8px;margin-bottom:10px;color:#e5edff;font-weight:900} #${UI_ID} .nss-step b{display:inline-grid;place-items:center;width:22px;height:22px;border-radius:999px;background:rgba(34,211,238,.16);border:1px solid rgba(34,211,238,.40);color:#67e8f9} #${UI_ID} .nss-step span{font-size:13px}
-      #${UI_ID} label{display:block;font-weight:800;color:#dbeafe;margin:8px 0 5px} #${UI_ID} input,#${UI_ID} textarea{width:100%;border:1px solid rgba(148,163,184,.28);border-radius:12px;background:rgba(2,6,23,.62);color:#fff;padding:9px 10px;outline:none}
-      #${UI_ID} input::placeholder,#${UI_ID} textarea::placeholder{color:#64748b} #${UI_ID} textarea{resize:vertical;min-height:66px}
-      #${UI_ID} input:focus,#${UI_ID} textarea:focus{border-color:rgba(34,211,238,.88);box-shadow:0 0 0 3px rgba(34,211,238,.13)}
-      #${UI_ID} .nss-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:11px} #${UI_ID} .nss-primary-actions button:first-child{min-width:92px} #${UI_ID} .nss-save-actions{display:grid;grid-template-columns:2fr 1fr;gap:8px} #${UI_ID} .nss-save-actions button{width:100%}
-      #${UI_ID} .nss-mode-group{margin:10px 0} #${UI_ID} .nss-mode-title{margin:0 0 7px;color:#dbeafe;font-weight:900;font-size:12px} #${UI_ID} .nss-option-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:7px} #${UI_ID} .nss-option-grid.two{grid-template-columns:repeat(2,1fr)} #${UI_ID} .nss-option-grid.three{grid-template-columns:repeat(3,1fr)} #${UI_ID} .nss-radio-card{display:flex;align-items:center;gap:8px;margin:0;padding:9px 10px;border:1px solid rgba(148,163,184,.20);border-radius:12px;background:rgba(2,6,23,.32);cursor:pointer;color:#e0f2fe;font-weight:900} #${UI_ID} .nss-radio-card:hover{border-color:rgba(34,211,238,.45);background:rgba(14,116,144,.12)} #${UI_ID} .nss-radio-card input{width:auto;accent-color:#22d3ee} #${UI_ID} .nss-radio-card.is-disabled{opacity:.45;pointer-events:none} #${UI_ID} .nss-download-preview{margin-top:9px;padding:9px 10px;border:1px solid rgba(34,211,238,.22);border-radius:12px;background:rgba(14,116,144,.12);color:#a5f3fc;font-weight:900}
-      #${UI_ID} .nss-inline-actions{display:flex;gap:8px;margin:8px 0 10px} #${UI_ID} .nss-note{margin:10px 0 0;color:var(--nemo-soft);font-size:12px}
-      #${UI_ID} .nss-status-title{color:var(--nemo-soft);font-size:11px;font-weight:900;text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px} #${UI_ID} .nss-status{padding:0;color:#e2e8f0;font-weight:800} #${UI_ID} .nss-status.is-error{color:#fecaca}
-      #${UI_ID} .nss-summary{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:10px} #${UI_ID} .nss-summary>div{background:rgba(2,6,23,.42);border:1px solid rgba(148,163,184,.16);border-radius:14px;padding:10px;text-align:center}
-      #${UI_ID} .nss-summary strong{display:block;font-size:21px;color:#fff;line-height:1.1} #${UI_ID} .nss-summary span{display:block;color:var(--nemo-soft);font-size:11px;margin-top:2px}
-      #${UI_ID} details.nss-advanced summary,#${UI_ID} .nss-logbox summary{cursor:pointer;list-style:none;display:flex;justify-content:space-between;align-items:center;font-weight:900;color:#dbeafe} #${UI_ID} details.nss-advanced summary::-webkit-details-marker,#${UI_ID} .nss-logbox summary::-webkit-details-marker{display:none} #${UI_ID} details.nss-advanced summary:after,#${UI_ID} .nss-logbox summary:after{content:'+';color:var(--nemo-accent);font-weight:900} #${UI_ID} details[open].nss-advanced summary:after,#${UI_ID} .nss-logbox[open] summary:after{content:'–'} #${UI_ID} details.nss-advanced summary em{font-style:normal;color:var(--nemo-soft);font-size:11px;font-weight:800}
-      #${UI_ID} .nss-checks{display:grid;grid-template-columns:1fr;gap:8px;margin:10px 0} #${UI_ID} .nss-checks label{display:flex;align-items:center;gap:8px;margin:0;padding:8px 10px;border:1px solid rgba(148,163,184,.20);border-radius:12px;background:rgba(2,6,23,.36);font-weight:800;color:#dbeafe} #${UI_ID} .nss-checks input{width:auto;accent-color:#22d3ee}
-      #${UI_ID} .nss-metadata-checks{grid-template-columns:1fr} #${UI_ID} .nss-meta-summary{white-space:pre-wrap;margin:8px 0 10px;color:#dbeafe;font:12px/1.45 system-ui,-apple-system,Segoe UI,sans-serif;background:rgba(2,6,23,.38);border:1px solid rgba(148,163,184,.18);border-radius:12px;padding:10px} #${UI_ID} .nss-metadata-json summary{cursor:pointer;color:#67e8f9;font-weight:900;margin-top:8px} #${UI_ID} .nss-metadata-json textarea{margin-top:8px;min-height:90px}
-      #${UI_ID} .nss-pattern-presets{display:grid;grid-template-columns:1fr;gap:7px;margin:6px 0 10px} #${UI_ID} .nss-preset{display:flex;align-items:flex-start;gap:9px;margin:0;padding:9px 10px;border:1px solid rgba(148,163,184,.20);border-radius:12px;background:rgba(2,6,23,.32);cursor:pointer} #${UI_ID} .nss-preset:hover{border-color:rgba(34,211,238,.45);background:rgba(14,116,144,.12)} #${UI_ID} .nss-preset input{width:auto;margin-top:3px;accent-color:#22d3ee} #${UI_ID} .nss-preset span{display:block} #${UI_ID} .nss-preset b{display:block;color:#e0f2fe;font-size:12px} #${UI_ID} .nss-preset small{display:block;color:var(--nemo-soft);font-size:11px;margin-top:1px}
-      #${UI_ID} .nss-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:9px}
-      #${UI_ID} .nss-linktests{display:grid;gap:6px;margin:8px 0 10px} #${UI_ID} .nss-linktest{border:1px solid rgba(148,163,184,.20);border-radius:12px;padding:8px 10px;background:rgba(2,6,23,.36)} #${UI_ID} .nss-linktest strong{display:block;font-size:12px;color:#fff} #${UI_ID} .nss-linktest span{display:block;color:var(--nemo-soft);font-size:11px;margin-top:2px} #${UI_ID} .nss-linktest.ok{border-color:rgba(34,197,94,.42);background:rgba(20,83,45,.25)} #${UI_ID} .nss-linktest.bad{border-color:rgba(248,113,113,.42);background:rgba(127,29,29,.25)} #${UI_ID} .nss-empty-mini{color:var(--nemo-soft);font-size:12px;border:1px dashed rgba(148,163,184,.25);border-radius:12px;padding:8px 10px;background:rgba(2,6,23,.25)}
-      #${UI_ID} .nss-table-wrap{border:1px solid rgba(148,163,184,.20);border-radius:14px;overflow:auto;max-height:320px;background:rgba(2,6,23,.38)} #${UI_ID} table{border-collapse:collapse;width:100%;min-width:690px}
-      #${UI_ID} th,#${UI_ID} td{padding:9px 10px;border-bottom:1px solid rgba(148,163,184,.14);text-align:left;vertical-align:top} #${UI_ID} th{position:sticky;top:0;background:#111827;color:#9fb0c8;font-size:11px;text-transform:uppercase;letter-spacing:.05em;z-index:1}
-      #${UI_ID} td{color:#e5e7eb} #${UI_ID} td small{display:block;color:var(--nemo-soft);margin-top:2px;font-size:11px} #${UI_ID} tr.is-muted{opacity:.48} #${UI_ID} tr:hover{background:rgba(34,211,238,.05)} #${UI_ID} .nss-empty{text-align:center;color:var(--nemo-soft);padding:22px}
-      #${UI_ID} .nss-pill{display:inline-block;border-radius:999px;padding:3px 8px;font-size:11px;font-weight:900;margin:0 7px 5px 0} #${UI_ID} .nss-pill.ok{background:rgba(34,197,94,.18);color:#86efac;border:1px solid rgba(34,197,94,.35)} #${UI_ID} .nss-pill.bad{background:rgba(239,68,68,.16);color:#fecaca;border:1px solid rgba(239,68,68,.35)}
-      #${UI_ID} a{color:#67e8f9;font-weight:900;text-decoration:none;margin-right:8px} #${UI_ID} button.nss-mini{padding:4px 7px;border-radius:8px;font-size:11px;margin:2px 3px 2px 0;background:rgba(14,116,144,.22);border-color:rgba(34,211,238,.35);color:#a5f3fc}
-      #${UI_ID} pre{white-space:pre-wrap;max-height:160px;overflow:auto;margin:8px 0 0;color:#cbd5e1;font:11px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace;background:rgba(2,6,23,.35);border-radius:12px;padding:9px;border:1px solid rgba(148,163,184,.14)}
+      #${UI_ID}{--nc-bg:#0b1220;--nc-panel:#111827;--nc-card:#172033;--nc-line:#2a3a52;--nc-text:#eef2ff;--nc-soft:#8a9ab8;--nc-accent:#22d3ee;--nc-blue:#2563eb;--nc-good:#22c55e;--nc-warn:#f59e0b;--nc-bad:#ef4444;position:fixed;right:18px;bottom:18px;z-index:2147483647;width:min(560px,calc(100vw - 24px));max-height:min(720px,calc(100vh - 24px));display:flex;flex-direction:column;background:linear-gradient(180deg,rgba(15,23,42,.98),rgba(2,6,23,.98));color:var(--nc-text);border:1px solid rgba(148,163,184,.26);border-radius:16px;box-shadow:0 24px 72px rgba(0,0,0,.52);font:13px/1.5 system-ui,-apple-system,'Segoe UI',sans-serif;overflow:hidden;backdrop-filter:blur(12px)}
+      #${UI_ID} *{box-sizing:border-box} #${UI_ID} button,#${UI_ID} input,#${UI_ID} textarea,#${UI_ID} select{font:inherit}
 
-      #${UI_ID} .nss-mini-bubble{display:none;align-items:center;gap:8px;min-width:112px;max-width:min(280px,calc(100vw - 24px));padding:11px 14px;border-radius:999px;background:linear-gradient(135deg,#0891b2,#2563eb);border:1px solid rgba(34,211,238,.70);color:#fff;box-shadow:0 18px 45px rgba(0,0,0,.42);font-weight:900;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-      #${UI_ID} .nss-mini-dot{width:9px;height:9px;border-radius:999px;background:#86efac;box-shadow:0 0 0 3px rgba(134,239,172,.18);flex:0 0 auto}
-      #${UI_ID}.nss-running .nss-mini-dot{background:#fbbf24;box-shadow:0 0 0 3px rgba(251,191,36,.20);animation:nss-pulse 1.2s infinite}
+      /* ── Header ──────────────────────────────────────────────── */
+      #${UI_ID} .nss-header{display:flex;align-items:center;gap:10px;padding:10px 14px;background:linear-gradient(135deg,rgba(34,211,238,.13),rgba(37,99,235,.09));border-bottom:1px solid rgba(148,163,184,.18);flex-shrink:0}
+      #${UI_ID} .nss-brand{flex:0 0 auto}
+      #${UI_ID} .nss-brand strong{display:block;font-size:14px;font-weight:900;letter-spacing:.01em;color:#fff}
+      #${UI_ID} .nss-brand span{display:block;margin-top:1px;color:var(--nc-soft);font-size:11px;font-weight:700}
+
+      /* ── Tabs ────────────────────────────────────────────────── */
+      #${UI_ID} .nss-tabs{display:flex;flex:1;justify-content:center;gap:4px;padding:3px;background:rgba(0,0,0,.24);border-radius:10px;margin:0 8px}
+      #${UI_ID} .nss-tab{flex:1;padding:5px 10px;border-radius:7px;border:1px solid transparent;background:transparent;color:var(--nc-soft);font-weight:800;font-size:12px;cursor:pointer;transition:.15s ease;white-space:nowrap}
+      #${UI_ID} .nss-tab:hover:not(.nss-tab-active){color:var(--nc-text);background:rgba(255,255,255,.05)}
+      #${UI_ID} .nss-tab.nss-tab-active{background:rgba(34,211,238,.16);color:var(--nc-accent);border-color:rgba(34,211,238,.28);box-shadow:0 1px 0 rgba(255,255,255,.06) inset}
+      #${UI_ID} .nss-head-actions{display:flex;gap:6px;flex:0 0 auto}
+      #${UI_ID} .nss-head-actions button{padding:5px 9px;border:1px solid rgba(148,163,184,.25);border-radius:8px;background:rgba(15,23,42,.44);color:var(--nc-soft);cursor:pointer;font-size:13px;line-height:1;transition:.15s}
+      #${UI_ID} .nss-head-actions button:hover{border-color:rgba(34,211,238,.5);color:var(--nc-accent);background:rgba(30,41,59,.8)}
+
+      /* ── Progress bar ────────────────────────────────────────── */
+      #${UI_ID} .nss-progress{height:6px;background:rgba(255,255,255,.05);position:relative;flex-shrink:0;overflow:hidden}
+      #${UI_ID} .nss-progress-doc{position:absolute;top:0;left:0;height:3px;background:var(--nc-accent);border-radius:0 2px 2px 0;transition:width .35s ease;width:0%}
+      #${UI_ID} .nss-progress-page{position:absolute;bottom:0;left:0;height:3px;background:rgba(34,211,238,.38);border-radius:0 2px 2px 0;transition:width .18s ease;width:0%}
+
+      /* ── Mini bubble ─────────────────────────────────────────── */
+      #${UI_ID} .nss-mini-bubble{display:none;align-items:center;gap:8px;min-width:112px;max-width:min(280px,calc(100vw - 24px));padding:10px 16px;border-radius:999px;background:linear-gradient(135deg,#0891b2,#2563eb);border:1px solid rgba(34,211,238,.65);color:#fff;box-shadow:0 18px 45px rgba(0,0,0,.44);font-weight:900;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer}
+      #${UI_ID} .nss-mini-dot{width:8px;height:8px;border-radius:999px;background:#86efac;box-shadow:0 0 0 3px rgba(134,239,172,.16);flex:0 0 auto}
+      #${UI_ID}.nss-running .nss-mini-dot{background:#fbbf24;animation:nc-pulse 1.2s infinite}
+      @keyframes nc-pulse{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(.72);opacity:.65}}
+
+      /* ── Minimized ───────────────────────────────────────────── */
       #${UI_ID}.nss-minimized{width:auto;max-height:none;border:0;background:transparent;box-shadow:none;overflow:visible;backdrop-filter:none}
-      #${UI_ID}.nss-minimized .nss-header,#${UI_ID}.nss-minimized .nss-content{display:none}
+      #${UI_ID}.nss-minimized .nss-header,#${UI_ID}.nss-minimized .nss-progress,#${UI_ID}.nss-minimized .nss-panels{display:none}
       #${UI_ID}.nss-minimized .nss-mini-bubble{display:flex}
-      @keyframes nss-pulse{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(.72);opacity:.65}}
-      #${UI_ID}.nss-compact{width:min(392px,calc(100vw - 24px))} #${UI_ID}.nss-compact .nss-advanced,#${UI_ID}.nss-compact .nss-note,#${UI_ID}.nss-compact .nss-logbox{display:none} #${UI_ID}.nss-compact .nss-table-wrap{max-height:220px}
-      @media(max-width:640px){#${UI_ID}{right:10px;bottom:10px;width:calc(100vw - 20px);max-height:calc(100vh - 20px)}#${UI_ID} .nss-grid,#${UI_ID} .nss-summary,#${UI_ID} .nss-save-actions,#${UI_ID} .nss-option-grid{grid-template-columns:1fr}}
+
+      /* ── Panels ──────────────────────────────────────────────── */
+      #${UI_ID} .nss-panels{flex:1;overflow:hidden;display:flex;flex-direction:column;min-height:0}
+      #${UI_ID} .nss-panel{display:flex;flex-direction:column;flex:1;min-height:0}
+      #${UI_ID} .nss-panel[hidden]{display:none}
+      #${UI_ID} .nss-panel-scroll{flex:1;overflow-y:auto;padding:12px 14px;scroll-behavior:smooth}
+      #${UI_ID} .nss-panel-footer{flex-shrink:0;padding:10px 14px;border-top:1px solid rgba(148,163,184,.14);background:rgba(2,6,23,.5);display:flex;gap:8px;align-items:center}
+
+      /* ── Cards ───────────────────────────────────────────────── */
+      #${UI_ID} .nss-card{background:rgba(20,30,50,.82);border:1px solid rgba(148,163,184,.18);border-radius:13px;padding:12px;margin-bottom:8px}
+      #${UI_ID} .nss-status-card{background:rgba(20,30,50,.82);border:1px solid rgba(148,163,184,.18);border-radius:13px;padding:12px;margin-bottom:8px}
+
+      /* ── Details accordion ───────────────────────────────────── */
+      #${UI_ID} .nss-details{padding:0}
+      #${UI_ID} .nss-details-summary{cursor:pointer;list-style:none;padding:11px 12px;font-weight:900;color:#dbeafe;font-size:13px;display:flex;justify-content:space-between;align-items:center;border-radius:13px;transition:.15s}
+      #${UI_ID} .nss-details-summary::-webkit-details-marker{display:none}
+      #${UI_ID} .nss-details-summary::after{content:'+';color:var(--nc-accent);font-weight:900;font-size:14px}
+      #${UI_ID} details[open] .nss-details-summary{border-radius:13px 13px 0 0;background:rgba(34,211,238,.05)}
+      #${UI_ID} details[open] .nss-details-summary::after{content:'\u2013'}
+      #${UI_ID} details[open]>.nss-details-summary+*,#${UI_ID} details[open]>*:not(summary){padding:0 12px 12px}
+      #${UI_ID} .nss-sub-summary{cursor:pointer;color:#67e8f9;font-weight:900;font-size:12px;margin-top:4px}
+
+      /* ── Labels & inputs ─────────────────────────────────────── */
+      #${UI_ID} .nss-label{display:block;font-weight:800;color:#dbeafe;margin:0 0 5px;font-size:12px}
+      #${UI_ID} input:not([type=checkbox]):not([type=radio]),#${UI_ID} textarea{width:100%;border:1px solid rgba(148,163,184,.24);border-radius:10px;background:rgba(2,6,23,.6);color:#fff;padding:8px 10px;outline:none;transition:.15s}
+      #${UI_ID} input::placeholder,#${UI_ID} textarea::placeholder{color:#4d5e78}
+      #${UI_ID} textarea{resize:vertical;min-height:60px}
+      #${UI_ID} input:focus,#${UI_ID} textarea:focus{border-color:rgba(34,211,238,.82);box-shadow:0 0 0 3px rgba(34,211,238,.12)}
+
+      /* ── Subfolder hint ──────────────────────────────────────── */
+      #${UI_ID} .nss-subfolder-hint{margin-top:5px;font-size:11px;font-weight:800;color:var(--nc-accent);padding:4px 9px;background:rgba(34,211,238,.08);border:1px solid rgba(34,211,238,.22);border-radius:7px}
+
+      /* ── Buttons ─────────────────────────────────────────────── */
+      #${UI_ID} button{border:1px solid rgba(148,163,184,.26);background:rgba(15,23,42,.7);color:var(--nc-text);border-radius:9px;padding:7px 12px;font-weight:800;cursor:pointer;transition:.15s ease;line-height:1.3}
+      #${UI_ID} button:hover:not(:disabled){border-color:rgba(34,211,238,.65);background:rgba(30,41,59,.9);transform:translateY(-1px)}
+      #${UI_ID} button:disabled{opacity:.38;cursor:not-allowed;transform:none}
+      #${UI_ID} button.primary{background:linear-gradient(135deg,#0891b2,#2563eb);color:#fff;border-color:rgba(34,211,238,.75);padding:8px 18px;font-size:13px}
+      #${UI_ID} button.danger{background:rgba(127,29,29,.42);border-color:rgba(248,113,113,.36);color:#fecaca}
+
+      /* ── Action row ──────────────────────────────────────────── */
+      #${UI_ID} .nss-actions-row{display:flex;gap:7px}
+      #${UI_ID} .nss-actions-row button{font-size:12px;padding:6px 10px}
+
+      /* ── Note ────────────────────────────────────────────────── */
+      #${UI_ID} .nss-note{margin:8px 0 0;color:var(--nc-soft);font-size:11px;line-height:1.5}
+
+      /* ── Pattern presets ─────────────────────────────────────── */
+      #${UI_ID} .nss-pattern-presets{display:grid;grid-template-columns:1fr;gap:6px;margin:0 0 8px}
+      #${UI_ID} .nss-preset{display:flex;align-items:flex-start;gap:8px;margin:0;padding:8px 10px;border:1px solid rgba(148,163,184,.18);border-radius:10px;background:rgba(2,6,23,.3);cursor:pointer;transition:.15s}
+      #${UI_ID} .nss-preset:hover{border-color:rgba(34,211,238,.4);background:rgba(14,116,144,.1)}
+      #${UI_ID} .nss-preset input{width:auto;margin-top:3px;accent-color:var(--nc-accent)}
+      #${UI_ID} .nss-preset b{display:block;color:#e0f2fe;font-size:12px}
+      #${UI_ID} .nss-preset small{display:block;color:var(--nc-soft);font-size:11px;margin-top:1px}
+
+      /* ── Checks ──────────────────────────────────────────────── */
+      #${UI_ID} .nss-checks{display:grid;gap:6px}
+      #${UI_ID} .nss-checks label{display:flex;align-items:center;gap:8px;padding:7px 10px;border:1px solid rgba(148,163,184,.18);border-radius:10px;background:rgba(2,6,23,.32);font-weight:800;color:#dbeafe;cursor:pointer;font-size:12px}
+      #${UI_ID} .nss-checks input{width:auto;accent-color:var(--nc-accent);flex-shrink:0}
+
+      /* ── Grid ────────────────────────────────────────────────── */
+      #${UI_ID} .nss-grid-3{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+
+      /* ── Mode / radio cards ──────────────────────────────────── */
+      #${UI_ID} .nss-mode-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+      #${UI_ID} .nss-mode-group{}
+      #${UI_ID} .nss-mode-title{font-size:11px;font-weight:900;color:var(--nc-soft);text-transform:uppercase;letter-spacing:.07em;margin:0 0 6px}
+      #${UI_ID} .nss-option-grid{display:grid;gap:6px}
+      #${UI_ID} .nss-option-grid.two{grid-template-columns:repeat(2,1fr)}
+      #${UI_ID} .nss-option-grid.three{grid-template-columns:repeat(3,1fr)}
+      #${UI_ID} .nss-option-grid.four{grid-template-columns:repeat(4,1fr)}
+      #${UI_ID} .nss-radio-card{display:flex;align-items:center;gap:6px;margin:0;padding:7px 9px;border:1px solid rgba(148,163,184,.18);border-radius:9px;background:rgba(2,6,23,.3);cursor:pointer;color:#e0f2fe;font-weight:900;font-size:12px;transition:.15s}
+      #${UI_ID} .nss-radio-card:hover{border-color:rgba(34,211,238,.42);background:rgba(14,116,144,.1)}
+      #${UI_ID} .nss-radio-card input{width:auto;accent-color:var(--nc-accent);flex-shrink:0}
+      #${UI_ID} .nss-radio-card.is-disabled{opacity:.4;pointer-events:none}
+      #${UI_ID} .nss-download-preview{margin-top:10px;padding:8px 10px;border:1px solid rgba(34,211,238,.2);border-radius:9px;background:rgba(14,116,144,.1);color:#a5f3fc;font-weight:900;font-size:12px}
+
+      /* ── Status card ─────────────────────────────────────────── */
+      #${UI_ID} .nss-status{color:#e2e8f0;font-weight:800;font-size:13px;margin-bottom:8px;min-height:1.4em}
+      #${UI_ID} .nss-status.is-error{color:#fecaca}
+      #${UI_ID} .nss-summary{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+      #${UI_ID} .nss-summary>div{background:rgba(2,6,23,.4);border:1px solid rgba(148,163,184,.14);border-radius:10px;padding:8px;text-align:center}
+      #${UI_ID} .nss-summary strong{display:block;font-size:20px;color:#fff;line-height:1.1;font-weight:900}
+      #${UI_ID} .nss-summary span{display:block;color:var(--nc-soft);font-size:11px;margin-top:2px}
+
+      /* ── Metadata summary ────────────────────────────────────── */
+      #${UI_ID} .nss-meta-summary{white-space:pre-wrap;margin:0 0 10px;color:#dbeafe;font:12px/1.45 system-ui,-apple-system,'Segoe UI',sans-serif;background:rgba(2,6,23,.36);border:1px solid rgba(148,163,184,.16);border-radius:10px;padding:9px}
+
+      /* ── Table ───────────────────────────────────────────────── */
+      #${UI_ID} .nss-table-wrap{border:1px solid rgba(148,163,184,.18);border-radius:12px;overflow:auto;max-height:300px;background:rgba(2,6,23,.36)}
+      #${UI_ID} table{border-collapse:collapse;width:100%;min-width:440px}
+      #${UI_ID} th,#${UI_ID} td{padding:8px 10px;border-bottom:1px solid rgba(148,163,184,.12);text-align:left;vertical-align:middle}
+      #${UI_ID} th{position:sticky;top:0;background:#111827;color:var(--nc-soft);font-size:11px;text-transform:uppercase;letter-spacing:.05em;z-index:1;font-weight:900}
+      #${UI_ID} td{color:#e5e7eb;font-size:12px}
+      #${UI_ID} td small{display:block;color:var(--nc-soft);margin-top:2px;font-size:11px}
+      #${UI_ID} tr.is-muted{opacity:.44}
+      #${UI_ID} tr:hover{background:rgba(34,211,238,.04)}
+      #${UI_ID} .nss-empty{text-align:center;color:var(--nc-soft);padding:20px;font-size:12px}
+      #${UI_ID} .nss-pill{display:inline-block;border-radius:999px;padding:2px 8px;font-size:11px;font-weight:900}
+      #${UI_ID} .nss-pill.ok{background:rgba(34,197,94,.16);color:#86efac;border:1px solid rgba(34,197,94,.32)}
+      #${UI_ID} .nss-pill.bad{background:rgba(239,68,68,.14);color:#fecaca;border:1px solid rgba(239,68,68,.32)}
+      #${UI_ID} a{color:#67e8f9;font-weight:900;text-decoration:none}
+      #${UI_ID} a:hover{text-decoration:underline}
+
+      /* ── Row action details/popover ──────────────────────────── */
+      #${UI_ID} .nss-row-actions{position:relative;display:inline-block}
+      #${UI_ID} .nss-row-trigger{cursor:pointer;list-style:none;padding:4px 8px;border:1px solid rgba(148,163,184,.24);border-radius:7px;background:rgba(15,23,42,.6);color:var(--nc-soft);font-size:13px;font-weight:900;transition:.15s;user-select:none}
+      #${UI_ID} .nss-row-trigger::-webkit-details-marker{display:none}
+      #${UI_ID} .nss-row-actions[open] .nss-row-trigger{border-color:rgba(34,211,238,.5);color:var(--nc-accent);background:rgba(14,116,144,.18)}
+      #${UI_ID} .nss-row-menu{position:absolute;right:0;bottom:calc(100% + 4px);min-width:145px;background:#1a2a42;border:1px solid rgba(148,163,184,.22);border-radius:10px;padding:4px;z-index:50;box-shadow:0 8px 28px rgba(0,0,0,.45)}
+      #${UI_ID} .nss-row-menu a,#${UI_ID} .nss-row-menu button{display:block;width:100%;text-align:left;padding:6px 10px;border-radius:7px;border:none;background:transparent;color:var(--nc-text);font-size:12px;font-weight:800;cursor:pointer;text-decoration:none;transition:.12s}
+      #${UI_ID} .nss-row-menu a:hover,#${UI_ID} .nss-row-menu button:hover{background:rgba(34,211,238,.12);color:var(--nc-accent)}
+      #${UI_ID} .nss-row-menu a:hover{text-decoration:none}
+
+      /* ── Log panel ───────────────────────────────────────────── */
+      #${UI_ID} .nss-logcontent{white-space:pre-wrap;color:#94a3b8;font:11px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace;margin:0;padding:0}
+
+      /* ── Misc ────────────────────────────────────────────────── */
+      #${UI_ID} pre{white-space:pre-wrap;color:#94a3b8;font:11px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace;background:rgba(2,6,23,.32);border-radius:10px;padding:9px;border:1px solid rgba(148,163,184,.12);margin:0}
+
+      /* ── Responsive ──────────────────────────────────────────── */
+      @media(max-width:600px){
+        #${UI_ID}{right:8px;bottom:8px;width:calc(100vw - 16px);max-height:calc(100vh - 16px)}
+        #${UI_ID} .nss-grid-3,#${UI_ID} .nss-summary,#${UI_ID} .nss-mode-row{grid-template-columns:1fr}
+        #${UI_ID} .nss-option-grid.four{grid-template-columns:repeat(2,1fr)}
+        #${UI_ID} table{min-width:320px}
+      }
     `;
     document.head.appendChild(style);
   }
+
 
   /** Shows panel. */
   function show() {
