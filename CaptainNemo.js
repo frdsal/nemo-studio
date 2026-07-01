@@ -1,5 +1,5 @@
 // =============================================================================
-// CaptainNemo Subfolder Studio — Nemo Capture v1.5.3
+// CaptainNemo Subfolder Studio — Nemo Capture v1.5.4
 // Changelog: 2026-07-01
 //
 // Fixed:
@@ -55,7 +55,7 @@
 (() => {
   'use strict';
 
-  const APP_VERSION = '1.5.3';
+  const APP_VERSION = '1.5.4';
   const APP_KEY = '__nemoSubfolderStudioDownloaderV150__';
   const UI_ID = 'nemo_subfolder_studio_downloader_v150';
   const STYLE_ID = 'nemo_subfolder_studio_downloader_v150_style';
@@ -117,6 +117,7 @@
     pdfStats: null,
     pageMetaCache: new Map(),
     activeTab: 'setup',
+    loginStatus: 'unknown',
     progress: { docIndex: 0, docTotal: 0, pageIndex: 0, pageTotal: 0 },
     courseMetadata: null,
     resolvedCourse: null,
@@ -1801,6 +1802,43 @@
     if (state.nodes.logs) state.nodes.logs.textContent = state.logs.join('\n') || 'Belum ada aktivitas.';
   }
 
+  /** Probes one PNG request to detect whether the user is logged in to Pustaka UT.
+   *  Result is cached in state.loginStatus for the duration of the session. */
+  async function checkLoginStatus() {
+    if (state.loginStatus === 'ok') return;
+    try {
+      // Probe /reader/index.php — selalu ada, tidak bergantung subfolder/doc tertentu
+      const url = new URL('/reader/index.php', location.origin);
+      const res = await fetch(url.href, { credentials: 'include', method: 'HEAD', redirect: 'manual' });
+      // type 'opaqueredirect' atau status 0/3xx = redirect ke login = belum login
+      // status 200 = halaman reader terbuka = sudah login
+      state.loginStatus = (res.type === 'opaqueredirect' || res.status === 0 || (res.status >= 300 && res.status < 400))
+        ? 'logged-out'
+        : res.status === 200 ? 'ok' : 'logged-out';
+    } catch {
+      state.loginStatus = 'logged-out';
+    }
+    updateLoginBanner();
+  }
+
+  /** Shows or hides the login banner based on state.loginStatus. */
+  function updateLoginBanner() {
+    const banner = state.nodes && state.nodes.loginBanner;
+    if (!banner) return;
+    if (state.loginStatus === 'ok') {
+      banner.hidden = true;
+    } else {
+      banner.hidden = false;
+      if (state.loginStatus === 'logged-out') {
+        banner.querySelector('[data-nss="loginBannerText"]').textContent =
+          'Belum login ke Pustaka UT. Akses ke dokumen akan ditolak server.';
+      } else {
+        banner.querySelector('[data-nss="loginBannerText"]').textContent =
+          'Memeriksa status login...';
+      }
+    }
+  }
+
   /** Switches the active tab panel and updates tab button states. */
   function switchTab(tabId) {
     if (!state.nodes.tabBtns || !state.nodes.panels) return;
@@ -3477,6 +3515,14 @@
         <span data-nss="miniBubbleText">Nemo</span>
       </button>
 
+      <div class="nss-login-banner" data-nss="loginBanner" hidden>
+        <span data-nss="loginBannerText">Memeriksa status login...</span>
+        <div class="nss-login-actions">
+          <a href="https://pustaka.ut.ac.id/reader/rbv.php" target="_blank" rel="noopener" class="nss-login-link">Login ke Pustaka UT</a>
+          <button type="button" data-nss="loginRecheck">Cek Ulang</button>
+        </div>
+      </div>
+
       <div class="nss-panels">
 
         <!-- ── SETUP ───────────────────────────────────────────── -->
@@ -3703,7 +3749,9 @@
       progressDoc: ui.querySelector('[data-nss="progressDoc"]'),
       progressPage: ui.querySelector('[data-nss="progressPage"]'),
       allInOneBtn: ui.querySelector('[data-nss="allInOneBtn"]'),
-      allInOneChecks: Array.from(ui.querySelectorAll('[data-nss-aio]'))
+      allInOneChecks: Array.from(ui.querySelectorAll('[data-nss-aio]')),
+      loginBanner: ui.querySelector('[data-nss="loginBanner"]'),
+      loginRecheck: ui.querySelector('[data-nss="loginRecheck"]')
     };
 
     const n = state.nodes;
@@ -3752,6 +3800,7 @@
     if (n.restoreBtn) n.restoreBtn.addEventListener('click', restoreUi);
 
     if (n.allInOneBtn) n.allInOneBtn.addEventListener('click', () => downloadAllInOneZip(selectedResults()));
+    if (n.loginRecheck) n.loginRecheck.addEventListener('click', () => { state.loginStatus = 'unknown'; checkLoginStatus(); });
     if (n.allInOneChecks) for (const input of n.allInOneChecks) {
       input.addEventListener('change', () => { readConfigFromUi(); saveConfig(); });
     }
@@ -3818,7 +3867,7 @@
 
       /* ── Minimized ───────────────────────────────────────────── */
       #${UI_ID}.nss-minimized{width:auto;max-height:none;border:0;background:transparent;box-shadow:none;overflow:visible;backdrop-filter:none}
-      #${UI_ID}.nss-minimized .nss-header,#${UI_ID}.nss-minimized .nss-progress,#${UI_ID}.nss-minimized .nss-panels{display:none}
+      #${UI_ID}.nss-minimized .nss-header,#${UI_ID}.nss-minimized .nss-progress,#${UI_ID}.nss-minimized .nss-login-banner,#${UI_ID}.nss-minimized .nss-panels{display:none}
       #${UI_ID}.nss-minimized .nss-mini-bubble{display:flex}
 
       /* ── Panels ──────────────────────────────────────────────── */
@@ -3939,6 +3988,15 @@
       /* ── Misc ────────────────────────────────────────────────── */
       #${UI_ID} pre{white-space:pre-wrap;color:#94a3b8;font:11px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace;background:rgba(2,6,23,.32);border-radius:10px;padding:9px;border:1px solid rgba(148,163,184,.12);margin:0}
 
+      /* ── Login banner ────────────────────────────────────────── */
+      #${UI_ID} .nss-login-banner{display:flex;align-items:flex-start;gap:10px;padding:9px 14px;background:rgba(245,158,11,.12);border-bottom:1px solid rgba(245,158,11,.32);flex-shrink:0;flex-wrap:wrap}
+      #${UI_ID} .nss-login-banner[hidden]{display:none}
+      #${UI_ID} .nss-login-banner span{flex:1;min-width:180px;color:#fcd34d;font-weight:800;font-size:12px;line-height:1.4}
+      #${UI_ID} .nss-login-actions{display:flex;gap:7px;align-items:center;flex-shrink:0}
+      #${UI_ID} .nss-login-link{padding:5px 11px;border-radius:8px;background:rgba(245,158,11,.22);border:1px solid rgba(245,158,11,.5);color:#fcd34d;font-weight:900;font-size:12px;text-decoration:none;white-space:nowrap;transition:.15s}
+      #${UI_ID} .nss-login-link:hover{background:rgba(245,158,11,.36);text-decoration:none}
+      #${UI_ID} .nss-login-banner button{padding:5px 10px;font-size:12px;border-color:rgba(245,158,11,.4);color:#fcd34d;background:transparent}
+
       /* ── Responsive ──────────────────────────────────────────── */
       @media(max-width:600px){
         #${UI_ID}{right:8px;bottom:8px;width:calc(100vw - 16px);max-height:calc(100vh - 16px)}
@@ -3956,6 +4014,7 @@
     const existing = document.getElementById(UI_ID);
     if (!existing) buildUi();
     else restoreUi();
+    checkLoginStatus();
   }
 
   /** Hides panel. */
