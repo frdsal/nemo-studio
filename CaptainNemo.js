@@ -1,5 +1,5 @@
 // =============================================================================
-// CaptainNemo Subfolder Studio — Nemo Capture v1.5.8
+// CaptainNemo Subfolder Studio — Nemo Capture v1.5.9
 // Changelog: 2026-07-01
 //
 // Fixed:
@@ -55,7 +55,7 @@
 (() => {
   'use strict';
 
-  const APP_VERSION = '1.5.8';
+  const APP_VERSION = '1.5.9';
   const APP_KEY = '__nemoSubfolderStudioDownloaderV150__';
   const UI_ID = 'nemo_subfolder_studio_downloader_v150';
   const STYLE_ID = 'nemo_subfolder_studio_downloader_v150_style';
@@ -1816,15 +1816,18 @@
   async function checkLoginStatus() {
     if (state.loginStatus === 'ok') return;
     try {
-      // HEAD view.php?format=png: 200 = login, 403 = belum login
-      // Terkonfirmasi via diagnostic manual. EKMA4101 dipakai karena subfoldernya ada.
+      // GET view.php?format=json, cek body text:
+      // "Incorrect file" = sudah login (server kenal sesi, tolak karena path)
+      // "Don't waste"    = belum login (server tidak kenal sesi sama sekali)
+      // Terkonfirmasi via diagnostic GET manual dua kondisi.
       const probeUrl = new URL(VIEW_PATH, location.origin);
-      probeUrl.searchParams.set('doc', 'DAFIS');
-      probeUrl.searchParams.set('format', 'png');
+      probeUrl.searchParams.set('doc', 'M1');
+      probeUrl.searchParams.set('format', 'json');
       probeUrl.searchParams.set('subfolder', 'EKMA4101/');
       probeUrl.searchParams.set('page', '1');
-      const res = await fetch(probeUrl.href, { credentials: 'include', method: 'HEAD' });
-      state.loginStatus = res.status === 403 ? 'logged-out' : 'ok';
+      const res = await fetch(probeUrl.href, { credentials: 'include' });
+      const body = await res.text();
+      state.loginStatus = body.includes('Incorrect file') ? 'ok' : 'logged-out';
     } catch {
       state.loginStatus = 'logged-out';
     }
